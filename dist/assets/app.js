@@ -5,9 +5,13 @@
   var BASE = '/qwen38';
   var API = BASE + '/api';
   var NOTIFY_KEY = 'meshdirect.notifications';
+  var PENDING_TURN_KEY = 'meshdirect.pendingTurn.v1';
   var STATE_POLL_MS = 5000;
   var JOB_POLL_MS = 2500;
   var MAX_MESSAGE = 12000;
+  var MAX_IMAGES = 4;
+  var MAX_IMAGE_BYTES = 5000000;
+  var MAX_IMAGE_TOTAL_BYTES = 12000000;
 
   var root = document.getElementById('app');
 
@@ -33,9 +37,11 @@
     clockTimer: null,
     pollTimer: null,
     streamController: null,
+    submitController: null,
     drawerOpen: false,
     sidebarCollapsed: false,
     notificationsEnabled: false,
+    attachments: [],
     sending: false
   };
 
@@ -52,7 +58,9 @@
     bell: '<path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
     bellOff: '<path d="M8.7 3a6 6 0 0 1 9.3 5v3.6M6.3 6.5C6.1 7 6 7.5 6 8c0 7-3 8-3 8h14.5"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/><path d="m2 2 20 20"/>',
     spark: '<path d="M12 2v4m0 12v4M2 12h4m12 0h4M5 5l2.5 2.5m9 9L19 19M5 19l2.5-2.5m9-9L19 5"/>',
-    chat: '<path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5Z"/>'
+    chat: '<path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5Z"/>',
+    attach: '<path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7l-9.6 9.6a2 2 0 0 1-2.8-2.8l8.9-8.9"/>',
+    image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>'
   };
 
   function icon(name, size) {
@@ -199,6 +207,69 @@
     try { localStorage.setItem(NOTIFY_KEY, state.notificationsEnabled ? '1' : '0'); } catch (e) { /* storage may be blocked */ }
   }
 
+  function attachmentKey(items) {
+    return (Array.isArray(items) ? items : []).map(function (item) {
+      return [item.fileName || '', item.mimeType || '', Number(item.size) || 0].join(':');
+    }).join('|');
+  }
+
+  function readPendingTurn() {
+    try {
+      var raw = localStorage.getItem(PENDING_TURN_KEY);
+      if (!raw) return null;
+      var pending = JSON.parse(raw);
+      if (!pending || typeof pending !== 'object'
+        || typeof pending.clientTurnId !== 'string'
+        || !/^[A-Za-z0-9_-]{12,80}$/.test(pending.clientTurnId)
+        || (pending.model !== 'preview' && pending.model !== 'stable')) {
+        localStorage.removeItem(PENDING_TURN_KEY);
+        return null;
+      }
+      return pending;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function persistPendingTurn(job, status) {
+    if (!job || typeof job.clientTurnId !== 'string') return;
+    var existing = readPendingTurn();
+    var descriptor = {
+      clientTurnId: job.clientTurnId,
+      username: state.username || '',
+      jobId: typeof job.jobId === 'string' ? job.jobId : null,
+      userMessageId: typeof job.userMessageId === 'string' ? job.userMessageId : null,
+      model: job.model,
+      message: typeof job.requestMessage === 'string' ? job.requestMessage : (typeof job.message === 'string' ? job.message : ''),
+      displayMessage: typeof job.message === 'string' ? job.message : '',
+      enqueuedAt: Number.isFinite(job.enqueuedAt) ? job.enqueuedAt : Date.now(),
+      status: status || job.state || 'submitting',
+      attachmentCount: Number.isSafeInteger(job.attachmentCount)
+        ? job.attachmentCount
+        : (Array.isArray(job.attachments) ? job.attachments.length : (existing && existing.attachmentCount) || 0),
+      attachmentKey: typeof job.attachmentKey === 'string'
+        ? job.attachmentKey
+        : (Array.isArray(job.attachments) && job.attachments.length
+          ? attachmentKey(job.attachments)
+          : (existing && existing.clientTurnId === job.clientTurnId && existing.attachmentKey) || '')
+    };
+    try { localStorage.setItem(PENDING_TURN_KEY, JSON.stringify(descriptor)); } catch (e) { /* storage may be blocked */ }
+  }
+
+  function clearPendingTurn(clientTurnId) {
+    try {
+      var pending = readPendingTurn();
+      if (!clientTurnId || !pending || pending.clientTurnId === clientTurnId) {
+        localStorage.removeItem(PENDING_TURN_KEY);
+      }
+    } catch (e) { /* storage may be blocked */ }
+  }
+
+  function pendingMatchesDraft(pending, model, message, attachments) {
+    return !!pending && pending.model === model && pending.message === message
+      && (pending.attachmentKey || '') === attachmentKey(attachments);
+  }
+
   /* ---------------- login view ---------------- */
 
   function renderLogin(message) {
@@ -219,7 +290,7 @@
             '<input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required /></div>' +
           '<button class="primary-button" id="login-button" type="submit">Sign in</button>' +
           '<p class="form-message" id="login-message" role="alert"></p>' +
-          '<div class="login-note">The model and SG credentials remain on the server. Your account password is sent only over HTTPS.</div>' +
+          '<div class="login-note">The model and gateway credentials remain on the server. Your account password is sent only over HTTPS.</div>' +
         '</form>' +
       '</section>';
     var form = $('#login-form');
@@ -278,9 +349,12 @@
           '<section class="chat-region" id="chat-region" aria-label="Conversation" tabindex="-1"><div class="messages" id="messages"></div></section>' +
           '<div class="status-strip" id="status-strip" role="status"><div class="status-strip-inner" id="status-strip-inner"></div></div>' +
           '<footer class="composer-shell">' +
+            '<div class="attachment-preview" id="attachment-preview" aria-live="polite"></div>' +
             '<form class="composer" id="composer-form">' +
+              '<input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />' +
+              '<button class="attach-button" id="attach-button" type="button" aria-label="Attach images">' + icon('attach', 20) + '</button>' +
               '<label class="sr-only" for="composer-input">Message Qwen</label>' +
-              '<textarea id="composer-input" maxlength="' + MAX_MESSAGE + '" rows="1" placeholder="Message Qwen..." required></textarea>' +
+              '<textarea id="composer-input" maxlength="' + MAX_MESSAGE + '" rows="1" placeholder="Message Qwen..."></textarea>' +
               '<button class="send-button" id="send-button" type="submit" aria-label="Send message">' + icon('send', 20) + '</button>' +
               '<button class="abort-button" id="abort-button" type="button" aria-label="Stop this turn" hidden>' + icon('stop', 18) + '</button>' +
             '</form>' +
@@ -295,6 +369,8 @@
     $('#notification-button').addEventListener('click', toggleNotifications);
     $('#logout-button').addEventListener('click', logout);
     $('#composer-form').addEventListener('submit', function (event) { event.preventDefault(); sendMessage(); });
+    $('#attach-button').addEventListener('click', function () { $('#image-input').click(); });
+    $('#image-input').addEventListener('change', selectImages);
     $('#abort-button').addEventListener('click', abortJob);
     var input = $('#composer-input');
     input.addEventListener('input', function () { resizeComposer(input); });
@@ -312,6 +388,7 @@
     renderModelBar();
     updateNotificationButton();
     renderStrip();
+    renderAttachments();
   }
 
   function isMobile() { return window.matchMedia('(max-width: 820px)').matches; }
@@ -348,6 +425,75 @@
   function resizeComposer(input) {
     input.style.height = 'auto';
     input.style.height = Math.min(180, input.scrollHeight) + 'px';
+  }
+
+  function selectImages(event) {
+    var files = Array.prototype.slice.call((event.target && event.target.files) || []);
+    event.target.value = '';
+    if (!files.length) return;
+    if (state.attachments.length + files.length > MAX_IMAGES) {
+      showToast('Attach no more than ' + MAX_IMAGES + ' images.');
+      return;
+    }
+    var currentBytes = state.attachments.reduce(function (sum, item) { return sum + item.size; }, 0);
+    var incomingBytes = files.reduce(function (sum, file) { return sum + file.size; }, 0);
+    if (files.some(function (file) { return file.size > MAX_IMAGE_BYTES; })) {
+      showToast('Each image must be 5 MB or smaller.');
+      return;
+    }
+    if (currentBytes + incomingBytes > MAX_IMAGE_TOTAL_BYTES) {
+      showToast('Attached images must total 12 MB or less.');
+      return;
+    }
+    var allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+    if (files.some(function (file) { return allowed.indexOf(file.type) === -1; })) {
+      showToast('Use PNG, JPEG, WebP, or GIF images.');
+      return;
+    }
+    Promise.all(files.map(function (file) {
+      return new Promise(function (resolve, reject) {
+        var reader = new FileReader();
+        reader.onload = function () {
+          resolve({ fileName: file.name || 'image', mimeType: file.type, content: String(reader.result || ''), size: file.size });
+        };
+        reader.onerror = function () { reject(new Error('Could not read ' + (file.name || 'image'))); };
+        reader.readAsDataURL(file);
+      });
+    })).then(function (items) {
+      state.attachments = state.attachments.concat(items);
+      renderAttachments();
+      announce(items.length + (items.length === 1 ? ' image attached.' : ' images attached.'));
+    }).catch(function (error) {
+      showToast(error.message || 'Could not read the selected image.');
+    });
+  }
+
+  function removeAttachment(index) {
+    state.attachments.splice(index, 1);
+    renderAttachments();
+  }
+
+  function renderAttachments() {
+    var target = $('#attachment-preview');
+    if (!target) return;
+    target.replaceChildren();
+    state.attachments.forEach(function (item, index) {
+      var chip = el('div', 'attachment-chip');
+      var image = document.createElement('img');
+      image.src = item.content;
+      image.alt = '';
+      chip.appendChild(image);
+      var name = el('span', '', item.fileName);
+      name.title = item.fileName;
+      chip.appendChild(name);
+      var remove = el('button', '', '×');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', 'Remove ' + item.fileName);
+      remove.addEventListener('click', function () { removeAttachment(index); });
+      chip.appendChild(remove);
+      target.appendChild(chip);
+    });
+    target.hidden = state.attachments.length === 0;
   }
 
   /* ---------------- notifications ---------------- */
@@ -474,7 +620,7 @@
         if (Number.isFinite(info.messageCount)) parts.push(info.messageCount + ' messages');
         if (info.lastActivityAt) parts.push(fmtTimestamp(info.lastActivityAt));
         if (parts.length) sub = parts.join(' · ');
-        if (lane.running) sub = (lane.running.activity || 'running') + ' · ' + fmtClock(lane.running.elapsedMs) + ' · ' + sub;
+        if (lane.running) sub = 'running ' + fmtClock(lane.running.elapsedMs) + ' · ' + sub;
         else if (info.busy) sub = 'busy · ' + sub;
         else if (lane.queued > 0) sub = lane.queued + ' queued · ' + sub;
       }
@@ -509,7 +655,7 @@
       var copy = el('span', 'model-copy');
       copy.appendChild(el('strong', '', model.label));
       var detail = model.detail || '';
-      if (lane.running) detail = (lane.running.activity || 'Running') + ' · ' + fmtClock(lane.running.elapsedMs);
+      if (lane.running) detail = 'Running ' + fmtClock(lane.running.elapsedMs);
       else if (lane.queued > 0) detail = lane.queued + ' in queue';
       else if (busy) detail = 'Busy';
       copy.appendChild(el('span', '', detail));
@@ -560,6 +706,17 @@
     bubble.textContent = message.content || '';
     wrap.appendChild(meta);
     wrap.appendChild(bubble);
+    if (message.role === 'user' && Array.isArray(message.attachments) && message.attachments.length) {
+      var gallery = el('div', 'message-images');
+      message.attachments.forEach(function (attachment) {
+        var preview = document.createElement('img');
+        preview.src = attachment.content || attachment.url || '';
+        preview.alt = attachment.fileName || 'Attached image';
+        preview.loading = 'lazy';
+        gallery.appendChild(preview);
+      });
+      wrap.appendChild(gallery);
+    }
     if (message.role === 'assistant' && Array.isArray(message.tools) && message.tools.length) {
       var tools = el('div', 'message-tools');
       message.tools.slice(0, 20).forEach(function (tool) {
@@ -610,29 +767,6 @@
 
   /* ---------------- active job rendering ---------------- */
 
-  function renderToolTimeline(container, tools) {
-    if (!Array.isArray(tools) || !tools.length) return;
-    var timeline = el('section', 'tool-timeline');
-    timeline.setAttribute('aria-label', 'Agent tool activity');
-    var heading = el('div', 'tool-timeline-heading');
-    heading.appendChild(el('strong', '', 'Agent actions'));
-    heading.appendChild(el('span', '', tools.length + (tools.length === 1 ? ' tool call' : ' tool calls')));
-    timeline.appendChild(heading);
-    tools.slice(-20).forEach(function (tool) {
-      var status = tool && tool.status ? String(tool.status) : 'running';
-      var row = el('div', 'tool-row ' + status);
-      row.appendChild(el('span', 'tool-state-dot'));
-      var copy = el('span', 'tool-row-copy');
-      copy.appendChild(el('strong', '', tool && (tool.label || tool.name) ? String(tool.label || tool.name) : 'tool'));
-      var detail = tool && tool.summary ? String(tool.summary) : (status === 'running' ? 'running…' : status);
-      if (tool && Number.isFinite(tool.durationMs) && status !== 'running') detail += ' · ' + fmtClock(tool.durationMs);
-      copy.appendChild(el('span', '', detail));
-      row.appendChild(copy);
-      timeline.appendChild(row);
-    });
-    container.appendChild(timeline);
-  }
-
   function renderActiveJob(container) {
     var job = state.job;
     if (!job || job.model !== state.selectedModel) return;
@@ -643,6 +777,16 @@
     umeta.appendChild(el('span', '', 'You'));
     user.appendChild(umeta);
     user.appendChild(el('div', 'message-bubble', job.message));
+    if (Array.isArray(job.attachments) && job.attachments.length) {
+      var gallery = el('div', 'message-images');
+      job.attachments.forEach(function (attachment) {
+        var preview = document.createElement('img');
+        preview.src = attachment.content;
+        preview.alt = attachment.fileName || 'Attached image';
+        gallery.appendChild(preview);
+      });
+      user.appendChild(gallery);
+    }
     container.appendChild(user);
 
     // streaming / finished assistant bubble
@@ -658,6 +802,14 @@
       bubble.textContent = job.reply != null ? job.reply : job.streamText;
       wrap.appendChild(meta);
       wrap.appendChild(bubble);
+      if (Array.isArray(job.tools) && job.tools.length) {
+        var toolList = el('div', 'message-tools');
+        job.tools.slice(-20).forEach(function (tool) {
+          var label = tool && typeof tool === 'object' ? (tool.label || 'tool') : String(tool);
+          toolList.appendChild(el('span', 'tool-chip ' + (tool.status || ''), label));
+        });
+        wrap.appendChild(toolList);
+      }
       container.appendChild(wrap);
     } else if (job.state === 'running' || job.state === 'queued' || job.state === 'submitting') {
       var typing = el('div', 'typing');
@@ -669,8 +821,6 @@
       container.appendChild(typing);
     }
 
-    renderToolTimeline(container, job.tools);
-
     // turn state card
     if (job.state !== 'done') {
       var card = el('div', 'turn-state ' + (job.state === 'error' ? 'failed' : (job.state === 'queued' || job.state === 'submitting') ? 'queued' : 'running'));
@@ -679,14 +829,8 @@
       var text;
       if (job.state === 'error') text = 'Turn failed: ' + (job.error || 'Unknown error');
       else if (job.state === 'queued') text = 'Queued' + (job.queuePosition ? ' · position ' + job.queuePosition : '') + ' · ' + fmtClock(Date.now() - job.enqueuedAt);
-      else if (job.state === 'submitting') text = 'Sending…';
-      else {
-        var activity = job.activity || 'running';
-        var counters = [];
-        if (job.step) counters.push('step ' + job.step);
-        if (job.toolCalls) counters.push(job.toolCalls + (job.toolCalls === 1 ? ' tool' : ' tools'));
-        text = activity + ' · ' + fmtClock(Date.now() - job.enqueuedAt) + (counters.length ? ' · ' + counters.join(' · ') : '') + (job.mode === 'poll' ? ' · polling' : ' · live');
-      }
+      else if (job.state === 'submitting') text = (job.activity || 'Sending') + '…';
+      else text = (job.activity || 'Running') + ' · ' + fmtClock(Date.now() - job.enqueuedAt) + (job.mode === 'poll' ? ' · polling' : ' · live');
       summary.appendChild(el('span', '', text));
       card.appendChild(summary);
       container.appendChild(card);
@@ -707,25 +851,40 @@
     return request('/history?model=' + encodeURIComponent(modelId) + '&sessionId=main&limit=120')
       .then(function (payload) {
         var messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
+        var priorAttachments = {};
+        hist.messages.forEach(function (message) {
+          if (message.id && Array.isArray(message.attachments) && message.attachments.length) {
+            priorAttachments[message.id] = message.attachments;
+          }
+        });
+        var activeJob = state.job && state.job.model === modelId ? state.job : null;
         hist.messages = messages.map(function (m) {
+          var attachments = m && Array.isArray(m.attachments) ? m.attachments : [];
+          if (!attachments.length && m && m.id && priorAttachments[m.id]) attachments = priorAttachments[m.id];
+          if (!attachments.length && activeJob && m && m.id === activeJob.userMessageId) {
+            attachments = activeJob.attachments || [];
+          }
           return {
             id: m && m.id,
             role: m && m.role === 'user' ? 'user' : 'assistant',
             content: m && typeof m.content === 'string' ? m.content : '',
             timestamp: m ? m.timestamp : null,
-            tools: m && Array.isArray(m.tools) ? m.tools : []
+            tools: m && Array.isArray(m.tools) ? m.tools : [],
+            attachments: attachments
           };
         });
         hist.loaded = true;
         hist.error = '';
         if (modelId === state.selectedModel && !state.job) renderMessages(!!scroll);
         else if (modelId === state.selectedModel) renderMessages(false);
+        return true;
       })
       .catch(function (err) {
-        if (hist.loaded) return; // keep stale history on refresh failure
+        if (hist.loaded) return false; // keep stale history and the optimistic completed job
         hist.loaded = false;
         hist.error = (err && err.message) || 'Could not load history.';
         if (modelId === state.selectedModel) renderMessages(false);
+        return false;
       });
   }
 
@@ -741,14 +900,245 @@
   function updateSendControls() {
     var send = $('#send-button');
     var abort = $('#abort-button');
+    var attach = $('#attach-button');
     var input = $('#composer-input');
     var active = !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
     if (send) {
       send.hidden = active;
       send.disabled = state.sending;
     }
-    if (abort) abort.hidden = !active;
+    if (abort) {
+      abort.hidden = !active;
+      abort.disabled = !!(state.job && state.job.stopInFlight);
+    }
+    if (attach) attach.disabled = state.sending || active;
     if (input) input.disabled = false; // composing during a turn is allowed; send is blocked below
+  }
+
+  function newClientTurnId() {
+    return 'web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 14);
+  }
+
+  function waitMs(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function lookupClientTurn(clientTurnId, attempts) {
+    attempts = Math.max(1, attempts || 1);
+    return request('/chat/by-client/' + encodeURIComponent(clientTurnId))
+      .catch(function (err) {
+        if (attempts <= 1 || (err && err.status && err.status !== 404 && err.status < 500)) throw err;
+        // A cancelled submission can reach the server just after our lookup.
+        // Retry both transient transport failures and a short-lived 404 race.
+        var delay = err && err.status === 404 ? 450 : 900;
+        return waitMs(delay).then(function () { return lookupClientTurn(clientTurnId, attempts - 1); });
+      });
+  }
+
+  function clearAcceptedDraft(job) {
+    var input = $('#composer-input');
+    if (input && input.value.trim() === (job.requestMessage || '')) {
+      input.value = '';
+      resizeComposer(input);
+    }
+    if (attachmentKey(state.attachments) === (job.attachmentKey || '')) {
+      state.attachments = [];
+      renderAttachments();
+    }
+  }
+
+  function hydrateRecoveredJob(pending, info) {
+    info = info || {};
+    var requestMessage = typeof pending.message === 'string' ? pending.message : '';
+    var displayMessage = typeof info.message === 'string' && info.message
+      ? info.message
+      : (pending.displayMessage || requestMessage || 'Submitted turn');
+    return {
+      jobId: typeof info.jobId === 'string' ? info.jobId : (pending.jobId || null),
+      clientTurnId: pending.clientTurnId,
+      userMessageId: typeof info.userMessageId === 'string' ? info.userMessageId : (pending.userMessageId || null),
+      model: info.model === 'stable' || info.model === 'preview' ? info.model : pending.model,
+      requestMessage: requestMessage,
+      message: displayMessage,
+      attachments: [],
+      attachmentCount: Number.isSafeInteger(pending.attachmentCount) ? pending.attachmentCount : 0,
+      attachmentKey: typeof pending.attachmentKey === 'string' ? pending.attachmentKey : '',
+      state: typeof info.state === 'string' ? info.state : 'queued',
+      queuePosition: Number.isSafeInteger(info.queuePosition) ? info.queuePosition : null,
+      enqueuedAt: Number.isFinite(info.createdAt) ? info.createdAt : (Number(pending.enqueuedAt) || Date.now()),
+      streamText: '',
+      reply: info.reply != null ? String(info.reply) : null,
+      usage: info.usage || null,
+      elapsedMs: Number.isFinite(info.elapsedMs) ? info.elapsedMs : null,
+      error: typeof info.error === 'string' ? info.error : null,
+      activity: typeof info.activity === 'string' ? info.activity : 'Recovering turn',
+      tools: Array.isArray(info.tools) ? info.tools : [],
+      mode: 'sse'
+    };
+  }
+
+  function adoptClientTurn(job, info, quiet) {
+    if (!info || typeof info.jobId !== 'string' || !info.jobId) {
+      throw new ApiError('The server returned an invalid turn.', 0);
+    }
+    job.jobId = info.jobId;
+    job.userMessageId = typeof info.userMessageId === 'string' ? info.userMessageId : job.userMessageId;
+    job.model = info.model === 'stable' || info.model === 'preview' ? info.model : job.model;
+    job.enqueuedAt = Number.isFinite(info.createdAt) ? info.createdAt : job.enqueuedAt;
+    job.state = info.state;
+    job.queuePosition = Number.isSafeInteger(info.queuePosition) ? info.queuePosition : null;
+    job.activity = typeof info.activity === 'string' ? info.activity : job.activity;
+    job.tools = Array.isArray(info.tools) ? info.tools : job.tools;
+    state.job = job;
+    state.sending = false;
+    clearAcceptedDraft(job);
+    if (state.selectedModel !== job.model) state.selectedModel = job.model;
+    renderSidebar();
+    renderModelBar();
+
+    if (info.state === 'done') {
+      finishJob(job, info.reply != null ? String(info.reply) : job.streamText, info.usage, info.elapsedMs, !!quiet);
+      return;
+    }
+    if (info.state === 'error') {
+      failJob(job, typeof info.error === 'string' && info.error ? info.error : 'The turn failed.');
+      return;
+    }
+    if (info.state !== 'queued' && info.state !== 'running') {
+      throw new ApiError('The server returned an unknown turn state.', 0);
+    }
+    persistPendingTurn(job, info.state);
+    setComposerStatus('');
+    renderMessages(true);
+    updateSendControls();
+    openStream(job);
+    startClock();
+  }
+
+  function markTurnUnconfirmed(job, message, status) {
+    if (state.job !== job) return;
+    stopJobPoll();
+    closeStream();
+    job.state = 'error';
+    job.error = message;
+    job.activity = status === 'retryable' ? 'Ready to retry safely' : 'Status unknown';
+    persistPendingTurn(job, status || 'uncertain');
+    stopClock();
+    setComposerStatus(message, true);
+    renderMessages(true);
+    updateSendControls();
+    refreshState();
+  }
+
+  function recoverSubmittedJob(job, originalError, retryableOnNotFound) {
+    return lookupClientTurn(job.clientTurnId, 3)
+      .then(function (info) {
+        if (state.job !== job) return false;
+        adoptClientTurn(job, info, false);
+        return true;
+      })
+      .catch(function (lookupError) {
+        if (state.job !== job) return false;
+        var missing = lookupError && lookupError.status === 404;
+        var detail = (originalError && originalError.message) || 'The connection ended before the server replied.';
+        if (missing && retryableOnNotFound) {
+          markTurnUnconfirmed(job, detail + ' The server did not accept it; retry will use the same turn id.', 'retryable');
+        } else {
+          markTurnUnconfirmed(job, detail + ' Its server status is unknown. Retry the same message or reload to recover it.', 'uncertain');
+        }
+        return false;
+      });
+  }
+
+  function terminalClientState(info) {
+    return !!info && (info.state === 'done' || info.state === 'error');
+  }
+
+  function waitForTerminalClientTurn(clientTurnId, attempts) {
+    return lookupClientTurn(clientTurnId, 1).then(function (info) {
+      if (terminalClientState(info) || attempts <= 1) return info;
+      return waitMs(500).then(function () {
+        return waitForTerminalClientTurn(clientTurnId, attempts - 1);
+      });
+    });
+  }
+
+  function resumeAfterStopAttempt(job, info, stopAccepted) {
+    if (state.job !== job || job.state === 'done' || job.state === 'error') return;
+    adoptClientTurn(job, info, true);
+    if (state.job !== job || job.state === 'done' || job.state === 'error') return;
+    if (!stopAccepted) job.stopRequested = false;
+    job.activity = stopAccepted ? 'Waiting for stop confirmation' : 'Turn continues';
+    persistPendingTurn(job, stopAccepted ? 'stopping' : job.state);
+    setComposerStatus(stopAccepted
+      ? 'Stop accepted; waiting for terminal confirmation…'
+      : 'The stop could not be confirmed. The turn is still connected.', !stopAccepted);
+    updateJobCard();
+  }
+
+  function issueSubmittedAbort(job, canReissue) {
+    return request('/chat/by-client/' + encodeURIComponent(job.clientTurnId) + '/abort', { method: 'POST', body: {} })
+      .then(function (result) {
+        if (state.job !== job || job.state === 'done' || job.state === 'error') return;
+        if (terminalClientState(result) && result.jobId) {
+          adoptClientTurn(job, result, true);
+          return;
+        }
+        if (result && result.aborted) {
+          // A running job may need a moment to unwind. Do not label it stopped
+          // until GET by-client reports a terminal state.
+          return waitForTerminalClientTurn(job.clientTurnId, 4)
+            .then(function (info) {
+              if (state.job !== job || job.state === 'done' || job.state === 'error') return;
+              if (terminalClientState(info)) adoptClientTurn(job, info, true);
+              else resumeAfterStopAttempt(job, info, true);
+            })
+            .catch(function () {
+              if (state.job === job && job.state !== 'done' && job.state !== 'error') {
+                markTurnUnconfirmed(job, 'The stop request was accepted, but its terminal server status could not be confirmed. Reload to recover it.', 'uncertain');
+              }
+            });
+        }
+        return lookupClientTurn(job.clientTurnId, 3)
+          .then(function (info) {
+            if (state.job !== job || job.state === 'done' || job.state === 'error') return;
+            if (terminalClientState(info)) {
+              adoptClientTurn(job, info, true);
+            } else if (canReissue) {
+              return issueSubmittedAbort(job, false);
+            } else {
+              resumeAfterStopAttempt(job, info, false);
+            }
+          })
+          .catch(function () {
+            if (state.job === job && job.state !== 'done' && job.state !== 'error') {
+              markTurnUnconfirmed(job, 'The stop status could not be confirmed. Retry the same message or reload to recover it.', 'uncertain');
+            }
+          });
+      })
+      .catch(function (abortError) {
+        if (state.job !== job || job.state === 'done' || job.state === 'error') return;
+        // The first abort may have raced ahead of enqueue. Find the turn and
+        // reissue the abort once after it becomes visible.
+        return lookupClientTurn(job.clientTurnId, 3)
+          .then(function (info) {
+            if (state.job !== job || job.state === 'done' || job.state === 'error') return;
+            if (terminalClientState(info)) {
+              adoptClientTurn(job, info, true);
+            } else if (canReissue) {
+              return issueSubmittedAbort(job, false);
+            } else {
+              resumeAfterStopAttempt(job, info, false);
+            }
+          })
+          .catch(function () {
+            if (state.job === job && job.state !== 'done' && job.state !== 'error') {
+              markTurnUnconfirmed(job,
+                ((abortError && abortError.message) || 'The stop request failed.') + ' Its server status is unknown; reload to recover it.',
+                'uncertain');
+            }
+          });
+      });
   }
 
   function sendMessage() {
@@ -759,17 +1149,38 @@
       return;
     }
     var message = input.value.trim();
-    if (!message) return;
+    var attachments = state.attachments.slice();
+    if (!message && !attachments.length) return;
     if (message.length > MAX_MESSAGE) {
       setComposerStatus('Message is too long (max ' + MAX_MESSAGE + ' chars).', true);
       return;
     }
+    var pending = readPendingTurn();
+    var reusePending = pending && (pending.status === 'uncertain' || pending.status === 'retryable')
+      && pendingMatchesDraft(pending, state.selectedModel, message, attachments);
+    if (pending && pending.status === 'uncertain' && !reusePending) {
+      setComposerStatus('The previous turn still has an unknown server status. Retry the same message or reload before starting another.', true);
+      return;
+    }
+    if (pending && pending.status === 'retryable' && !reusePending
+      && pending.attachmentCount > 0 && pending.message === message && attachments.length === 0) {
+      setComposerStatus('Reattach the image' + (pending.attachmentCount === 1 ? '' : 's') + ' before retrying that turn.', true);
+      return;
+    }
+    if (pending && !reusePending) clearPendingTurn(pending.clientTurnId);
+
     state.sending = true;
+    var submitController = new AbortController();
+    state.submitController = submitController;
     setComposerStatus('');
     var job = {
       jobId: null,
       model: state.selectedModel,
-      message: message,
+      requestMessage: message,
+      message: message || 'Attached ' + attachments.length + (attachments.length === 1 ? ' image' : ' images'),
+      attachments: attachments,
+      attachmentCount: attachments.length,
+      attachmentKey: attachmentKey(attachments),
       state: 'submitting',
       queuePosition: null,
       enqueuedAt: Date.now(),
@@ -778,40 +1189,47 @@
       usage: null,
       elapsedMs: null,
       error: null,
-      mode: 'sse',
-      activity: 'submitting',
-      step: 0,
-      toolCalls: 0,
-      currentTool: null,
-      tools: []
+      activity: 'Sending',
+      tools: [],
+      mode: 'sse'
     };
+    job.clientTurnId = reusePending ? pending.clientTurnId : newClientTurnId();
     state.job = job;
+    persistPendingTurn(job, 'submitting');
     renderMessages(true);
     updateSendControls();
     request('/chat', {
       method: 'POST',
-      body: { message: message, model: job.model, sessionId: 'main' }
+      signal: submitController.signal,
+      body: {
+        message: message,
+        model: job.model,
+        sessionId: 'main',
+        clientTurnId: job.clientTurnId,
+        attachments: attachments.map(function (item) {
+          return { fileName: item.fileName, mimeType: item.mimeType, content: item.content };
+        })
+      }
     }).then(function (created) {
+      if (state.submitController === submitController) state.submitController = null;
       state.sending = false;
-      input.value = '';
-      resizeComposer(input);
       if (!created || typeof created.jobId !== 'string' || !created.jobId) {
         throw new ApiError('The server did not return a job id.', 0);
       }
-      job.jobId = created.jobId;
-      job.state = created.state === 'running' ? 'running' : 'queued';
-      job.queuePosition = Number.isSafeInteger(created.queuePosition) ? created.queuePosition : null;
-      setComposerStatus('');
-      updateJobCard();
-      openStream(job);
-      startClock();
+      adoptClientTurn(job, created, false);
     }).catch(function (err) {
+      if (state.submitController === submitController) state.submitController = null;
       state.sending = false;
-      job.state = 'error';
-      job.error = (err && err.message) || 'Could not send the message.';
-      setComposerStatus(job.error, true);
-      updateJobCard();
-      updateSendControls();
+      if (submitController.signal.aborted) {
+        // abortJob owns confirmation for user-requested stops. A local fetch
+        // abort alone does not prove the server did not enqueue the turn.
+        if (state.authenticated && !job.stopRequested && job.state !== 'error') {
+          recoverSubmittedJob(job, new Error('The send was interrupted.'), false);
+        }
+        return;
+      }
+      setComposerStatus('Checking whether the server accepted this turn…');
+      recoverSubmittedJob(job, err, true);
     });
   }
 
@@ -911,13 +1329,28 @@
         job.state = 'running';
         job.queuePosition = null;
       }
+      persistPendingTurn(job, job.stopRequested ? 'stopping' : job.state);
       updateJobCard();
     } else if (name === 'delta') {
       if (typeof data.text === 'string' && data.text) {
         if (job.state !== 'running') { job.state = 'running'; }
         appendDelta(job, data.text);
       }
+    } else if (name === 'activity') {
+      if (typeof data.label === 'string' && data.label) job.activity = data.label;
+      if (data.tool) {
+        var active = job.tools.filter(function (tool) {
+          return tool && tool.label === data.tool && tool.status === 'running';
+        })[0];
+        if (active) active.status = data.status || active.status;
+        else if (data.status === 'running') {
+          job.tools.push({ label: String(data.tool), status: 'running', time: new Date().toISOString() });
+        }
+        job.tools = job.tools.slice(-20);
+      }
+      updateJobCard();
     } else if (name === 'done') {
+      if (Array.isArray(data.tools)) job.tools = data.tools;
       finishJob(job, data.reply != null ? String(data.reply) : job.streamText, data.usage, data.elapsedMs);
     } else if (name === 'error') {
       failJob(job, typeof data.error === 'string' && data.error ? data.error : 'The turn failed.');
@@ -966,12 +1399,16 @@
           if (state.job !== job) return;
           if (!info) return;
           if (info.state === 'done') {
+            if (Array.isArray(info.tools)) job.tools = info.tools;
             finishJob(job, info.reply != null ? String(info.reply) : job.streamText, null, info.elapsedMs);
           } else if (info.state === 'error') {
             failJob(job, typeof info.error === 'string' && info.error ? info.error : 'The turn failed.');
           } else {
             job.state = info.state === 'running' ? 'running' : 'queued';
             job.queuePosition = Number.isSafeInteger(info.queuePosition) ? info.queuePosition : job.queuePosition;
+            if (typeof info.activity === 'string') job.activity = info.activity;
+            if (Array.isArray(info.tools)) job.tools = info.tools;
+            persistPendingTurn(job, job.stopRequested ? 'stopping' : job.state);
             updateJobCard();
             state.pollTimer = setTimeout(tick, JOB_POLL_MS);
           }
@@ -979,7 +1416,7 @@
         .catch(function (err) {
           if (state.job !== job) return;
           if (err && err.status === 404) {
-            failJob(job, 'That turn is no longer tracked (server restarted?). Send it again.');
+            markTurnUnconfirmed(job, 'That turn is no longer tracked (the server may have restarted). Retry will use the same turn id.', 'retryable');
             return;
           }
           state.pollTimer = setTimeout(tick, JOB_POLL_MS * 2);
@@ -997,23 +1434,26 @@
 
   /* --- job finish/fail/abort --- */
 
-  function finishJob(job, reply, usage, elapsedMs) {
+  function finishJob(job, reply, usage, elapsedMs, quiet) {
     if (state.job !== job) return;
     stopJobPoll();
     closeStream();
+    clearPendingTurn(job.clientTurnId);
     job.state = 'done';
     job.reply = reply;
     job.usage = usage || null;
     job.elapsedMs = Number.isFinite(elapsedMs) ? elapsedMs : (Date.now() - job.enqueuedAt);
     stopClock();
-    notifyReply(reply);
-    announce('Reply received.');
+    if (!quiet) {
+      notifyReply(reply);
+      announce('Reply received.');
+    }
     setComposerStatus('');
     renderMessages(true);
     updateSendControls();
     // reconcile with server history, then clear the optimistic job view
-    loadHistory(job.model, false).then(function () {
-      if (state.job === job && job.state === 'done') {
+    loadHistory(job.model, false).then(function (refreshed) {
+      if (refreshed && state.job === job && job.state === 'done') {
         state.job = null;
         renderMessages(false);
       }
@@ -1025,6 +1465,7 @@
     if (state.job !== job) return;
     stopJobPoll();
     closeStream();
+    clearPendingTurn(job.clientTurnId);
     job.state = 'error';
     job.error = message;
     stopClock();
@@ -1037,7 +1478,35 @@
 
   function abortJob() {
     var job = state.job;
-    if (!job || !job.jobId || job.state === 'done' || job.state === 'error') return;
+    if (!job || job.state === 'done' || job.state === 'error') return;
+    if (job.stopInFlight) return;
+    if (job.clientTurnId) {
+      job.stopInFlight = true;
+      job.stopRequested = true;
+      var controller = state.submitController;
+      state.submitController = null;
+      state.sending = false;
+      if (controller) {
+        try { controller.abort(); } catch (e) { /* noop */ }
+      }
+      job.activity = 'Confirming stop with server';
+      persistPendingTurn(job, 'stopping');
+      setComposerStatus('Confirming stop with the server…');
+      updateJobCard();
+      updateSendControls();
+      // Use a fresh request: aborting a submission fetch does not prove the
+      // server did not accept and enqueue it. The same path also keeps normal
+      // stops honest by waiting for a terminal snapshot.
+      issueSubmittedAbort(job, true).then(function () {
+        job.stopInFlight = false;
+        if (state.job === job) updateSendControls();
+      }, function () {
+        job.stopInFlight = false;
+        if (state.job === job) updateSendControls();
+      });
+      return;
+    }
+    if (!job.jobId) return;
     setComposerStatus('Stopping…');
     request('/chat/' + encodeURIComponent(job.jobId) + '/abort', { method: 'POST', body: {} })
       .then(function (result) {
@@ -1123,7 +1592,7 @@
       laneText = 'Queued';
     } else if (jobActive || lane.running || (info && info.busy)) {
       dotClass = 'status-dot running';
-      laneText = 'Lane busy';
+      laneText = jobActive && job.activity ? job.activity : 'Lane busy';
     }
     laneItem.appendChild(el('span', dotClass));
     laneItem.appendChild(el('span', '', laneText));
@@ -1194,6 +1663,75 @@
     }
   }
 
+  function recoverPendingTurn() {
+    var pending = readPendingTurn();
+    if (!pending) return Promise.resolve(false);
+    if (pending.username && pending.username !== state.username) {
+      clearPendingTurn(pending.clientTurnId);
+      return Promise.resolve(false);
+    }
+
+    var job = hydrateRecoveredJob(pending, {});
+    job.state = 'submitting';
+    job.activity = 'Recovering saved turn';
+    state.job = job;
+    state.sending = false;
+    state.selectedModel = job.model;
+    var input = $('#composer-input');
+    if (input && !input.value && pending.message) {
+      input.value = pending.message;
+      resizeComposer(input);
+    }
+    setComposerStatus('Recovering the turn from the server…');
+    renderSidebar();
+    renderModelBar();
+    renderMessages(true);
+    updateSendControls();
+
+    return lookupClientTurn(pending.clientTurnId, 3)
+      .then(function (info) {
+        if (state.job !== job) return false;
+        adoptClientTurn(job, info, true);
+        if (pending.status === 'stopping' && state.job === job
+          && job.state !== 'done' && job.state !== 'error') {
+          job.stopRequested = true;
+          job.stopInFlight = true;
+          job.activity = 'Restoring stop request';
+          persistPendingTurn(job, 'stopping');
+          setComposerStatus('Restoring the pending stop request…');
+          updateJobCard();
+          updateSendControls();
+          return issueSubmittedAbort(job, true).then(function () {
+            job.stopInFlight = false;
+            if (state.job === job) updateSendControls();
+            return true;
+          }, function () {
+            job.stopInFlight = false;
+            if (state.job === job) updateSendControls();
+            return false;
+          });
+        }
+        return true;
+      })
+      .catch(function (err) {
+        if (state.job !== job) return false;
+        if (err && err.status === 404 && pending.status !== 'stopping') {
+          markTurnUnconfirmed(job,
+            pending.attachmentCount > 0
+              ? 'The saved image turn is no longer tracked. Reattach the image' + (pending.attachmentCount === 1 ? '' : 's') + ' to retry it safely.'
+              : 'The saved turn is no longer tracked. Retry will use the same turn id.',
+            'retryable');
+        } else {
+          markTurnUnconfirmed(job,
+            pending.status === 'stopping'
+              ? 'The final stop status is unknown. Reload when connected to check again.'
+              : 'Could not confirm the saved turn with the server. Retry the same message or reload to recover it.',
+            'uncertain');
+        }
+        return false;
+      });
+  }
+
   /* ---------------- lifecycle ---------------- */
 
   function enterApp() {
@@ -1205,12 +1743,11 @@
       if (model.id !== state.selectedModel) loadHistory(model.id, false);
     });
     startStatePolling();
-    return Promise.resolve();
+    return recoverPendingTurn();
   }
 
   function logout() {
     request('/logout', { method: 'POST', body: {} })
-      .catch(function () { /* even on failure, drop local session */ })
       .then(function () {
         stopAll();
         state.authenticated = false;
@@ -1219,6 +1756,9 @@
         state.job = null;
         state.meshState = null;
         renderLogin('');
+      })
+      .catch(function (error) {
+        showToast((error && error.message) || 'Could not sign out.');
       });
   }
 
@@ -1226,6 +1766,10 @@
     stopStatePolling();
     stopJobPoll();
     closeStream();
+    if (state.submitController) {
+      state.submitController.abort();
+      state.submitController = null;
+    }
     if (state.clockTimer) {
       clearInterval(state.clockTimer);
       state.clockTimer = null;

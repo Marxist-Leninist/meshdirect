@@ -1,12 +1,13 @@
 {
   "name": "meshdirect",
-  "version": "2.0.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Owned autonomous Qwen 3.8 agent harness with native SG1/SG2 tools",
+  "description": "Native Qwen 3.8 chat harness with direct SG1/SG2 MCP tools",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test",
+    "check": "for file in server/*.js dist/assets/app.js; do node --check \"$file\" || exit 1; done && node --test"
   },
   "engines": {
     "node": ">=20.12"

@@ -31,11 +31,12 @@ curl -s -b "$JAR" "$API/history?model=preview&limit=3" | j 'messages.length'
 curl -s -b "$JAR" "$API/history?model=bogus"; echo
 curl -s -b "$JAR" "$API/history?model=preview&sessionId=other"; echo
 echo "== state =="
-curl -s -b "$JAR" $API/state | j 'openclawVersion'
+curl -s -b "$JAR" $API/state | j 'harnessVersion'
 curl -s -b "$JAR" $API/state | j 'models.map(m=>({m:m.model,busy:m.busy,msgs:m.messageCount}))'
 echo "== chat -> 202 =="
 T0=$(date +%s%3N)
-CHAT=$(curl -s -b "$JAR" -X POST $API/chat -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{"message":"Reply with exactly: meshdirect selftest ok","model":"stable","sessionId":"main"}')
+TURN1="selftest-$(date +%s%N)-stable"
+CHAT=$(curl -s -b "$JAR" -X POST $API/chat -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d "{\"message\":\"Reply with exactly: meshdirect selftest ok\",\"model\":\"stable\",\"sessionId\":\"main\",\"clientTurnId\":\"$TURN1\"}")
 echo "$CHAT" | head -c 300; echo
 JOB=$(echo "$CHAT" | j jobId | tr -d '"')
 echo "jobId: ${JOB:0:8}..."
@@ -62,7 +63,8 @@ echo "redirect chain: $NREDIR (must be '1 final=200')"; [ "$NREDIR" = "1 final=2
 FAV=$(curl -s -o /dev/null -w '%{http_code}' $BASE/qwen38/favicon.svg)
 echo "GET /qwen38/favicon.svg -> $FAV (must be 200)"; [ "$FAV" = "200" ] || echo "FAIL: favicon $FAV"
 echo "== abort test =="
-CHAT2=$(curl -s -b "$JAR" -X POST $API/chat -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{"message":"Write a very long essay about the history of computing, at least 2000 words.","model":"preview"}')
+TURN2="selftest-$(date +%s%N)-abort"
+CHAT2=$(curl -s -b "$JAR" -X POST $API/chat -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d "{\"message\":\"Write a very long essay about the history of computing, at least 2000 words.\",\"model\":\"preview\",\"clientTurnId\":\"$TURN2\"}")
 JOB2=$(echo "$CHAT2" | j jobId | tr -d '"')
 sleep 2
 curl -s -b "$JAR" -X POST "$API/chat/$JOB2/abort" -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{}'; echo

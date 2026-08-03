@@ -6,7 +6,7 @@ function randomToken(bytes) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
 function sha256b64url(s) {
-  return crypto.createHash('sha256').update(String(s)).digest('base64url');
+  return crypto.createHash('sha256').update(s).digest('base64url');
 }
 // constant-time compare via sha256 digests (handles unequal length safely)
 function secureEqual(a, b) {
@@ -22,15 +22,13 @@ function parseCookies(header) {
     if (i < 0) continue;
     const k = part.slice(0, i).trim();
     const v = part.slice(i + 1).trim();
-    if (!k) continue;
-    try { out[k] = decodeURIComponent(v); } catch { out[k] = v; }
+    if (k) out[k] = decodeURIComponent(v);
   }
   return out;
 }
 
 function redactSecrets(value) {
   return String(value == null ? '' : value)
-    .replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/g, '[PRIVATE KEY REDACTED]')
     .replace(/\bsk-(?:sp|ws|proj|live|test)?-?[A-Za-z0-9._-]{12,}\b/g, 'sk-REDACTED')
     .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, 'gh_REDACTED')
     .replace(/\bam_[A-Za-z0-9_]{20,}\b/g, 'am_REDACTED')
@@ -38,37 +36,13 @@ function redactSecrets(value) {
     .replace(/(Bearer\s+)[^\s"']+/gi, '$1REDACTED')
     .replace(/((?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*["']?)[^,\s"'}]{8,}/gi, '$1REDACTED');
 }
-
-// Error text sent to clients should not reveal credentials or sensitive host paths.
+// strip anything that looks like a secret or absolute server path from error text
 function sanitizeError(msg) {
   return redactSecrets(msg || 'unknown error')
-    .replace(/\/(?:root|etc|home)\/[^\s"']*/g, '[protected-path]')
-    .slice(0, 700);
+    .replace(/\/(?:root|etc|home|opt|usr|var)\/[^\s"']*/g, '[path]')
+    .slice(0, 500);
 }
-
-// Tool output remains operationally useful while credentials are stripped and size bounded.
-function sanitizeToolOutput(value, maxChars = 60000) {
-  let text;
-  if (typeof value === 'string') text = value;
-  else {
-    try { text = JSON.stringify(value, null, 2); }
-    catch { text = String(value); }
-  }
-  text = redactSecrets(text).replace(/\u0000/g, '');
-  if (text.length <= maxChars) return { text, truncated: false };
-  return {
-    text: text.slice(0, maxChars) + `\n\n[output truncated at ${maxChars} characters]`,
-    truncated: true,
-  };
-}
-
-function compactOneLine(value, maxChars = 280) {
-  const clean = redactSecrets(typeof value === 'string' ? value : JSON.stringify(value || {}))
-    .replace(/\s+/g, ' ').trim();
-  return clean.length > maxChars ? clean.slice(0, maxChars - 1) + '…' : clean;
-}
-
-// map provider/transport failures to the HTTP-ish job status contract
+// map provider/transport failures to the legacy HTTP-ish status contract
 function classifyStatus(msg) {
   const m = String(msg || '').toLowerCase();
   if (/(^|[^0-9])429|quota|rate limit/.test(m)) return 429;
@@ -76,8 +50,7 @@ function classifyStatus(msg) {
   if (/timed out|timeout|stall/.test(m)) return 504;
   return 502;
 }
-
 module.exports = {
   randomToken, sha256b64url, secureEqual, parseCookies,
-  redactSecrets, sanitizeError, sanitizeToolOutput, compactOneLine, classifyStatus,
+  redactSecrets, sanitizeError, classifyStatus,
 };

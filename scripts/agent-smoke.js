@@ -1,42 +1,49 @@
 #!/usr/bin/env node
 'use strict';
-const fs = require('fs');
-for (const line of fs.readFileSync('/etc/meshdirect-dev.env', 'utf8').split(/\r?\n/)) {
-  if (!line || line.trimStart().startsWith('#') || !line.includes('=')) continue;
-  const index = line.indexOf('=');
-  process.env[line.slice(0, index)] = line.slice(index + 1);
-}
-const config = require('../server/config');
-const modelclient = require('../server/modelclient');
-const { runAgent } = require('../server/agentloop');
 
-const log = () => {};
-modelclient.loadFallbackKey(config, log);
-const toolEvents = [];
-const statusEvents = [];
-let streamed = '';
+const config = require('../server/config');
+const { AgentLoop } = require('../server/agentloop');
+
+const lane = process.argv[2] === 'preview' ? 'preview' : 'stable';
+const prompt = process.argv.slice(3).join(' ') || [
+  "Use the sg1 function with action='search' to find mcp_reliability_status.",
+  "Then use sg1 with action='call' to invoke that exact tool with empty arguments.",
+  'Reply in one short sentence with the SG health you observed.',
+].join(' ');
+
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), config.turnTimeoutMs);
 
 (async () => {
-  const output = await runAgent(config, 'stable', [
-    { role: 'system', content: config.systemPrompt },
-    { role: 'user', content: 'Verify that both SG1 and SG2 are reachable. You must use sg_mcp with action health and server all, then answer with the two live tool counts. Do not guess.' },
-  ], {
-    onDelta: (text) => { streamed += text; },
-    onTool: (event) => { toolEvents.push({ name: event.name, status: event.status, phase: event.phase, summary: event.summary || '' }); },
-    onProgress: (event) => { statusEvents.push({ phase: event.phase, activity: event.activity, step: event.step, totalToolCalls: event.totalToolCalls }); },
-    onProviderError: () => {},
+  const events = [];
+  const loop = new AgentLoop(config, (message) => process.stderr.write(`[log] ${message}\n`));
+  const result = await loop.run({
+    modelId: config.lanes[lane].modelId,
+    messages: [
+      { role: 'system', content: config.systemPrompt },
+      { role: 'user', content: prompt },
+    ],
+    signal: controller.signal,
+    onActivity(event) {
+      events.push(event);
+      process.stderr.write(`[${event.phase}:${event.status}] ${event.label}\n`);
+    },
+    onProviderError(provider, status, message) {
+      process.stderr.write(`[provider:${provider}:${status}] ${message}\n`);
+    },
   });
-  const result = {
+  if (!result.tools.length) throw new Error('model completed without using SG1/SG2');
+  if (/<tool_call>/i.test(result.reply)) throw new Error('raw tool markup leaked into final reply');
+  process.stdout.write(JSON.stringify({
     ok: true,
-    reply: output.reply,
-    streamedMatchesReply: streamed.trim() === output.reply.trim(),
-    steps: output.steps,
-    toolCalls: output.toolCalls,
-    tools: toolEvents,
-    finalStatus: statusEvents.slice(-3),
-  };
-  process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    lane,
+    provider: result.provider,
+    rounds: result.rounds,
+    toolCalls: result.tools.length,
+    tools: result.tools.map((tool) => tool.label),
+    reply: result.reply,
+  }) + '\n');
 })().catch((error) => {
-  process.stdout.write(JSON.stringify({ ok: false, error: String(error && error.message || error) }) + '\n');
+  process.stderr.write(`smoke failed: ${error.message}\n`);
   process.exitCode = 1;
-});
+}).finally(() => clearTimeout(timer));

@@ -1,0 +1,65 @@
+#!/usr/bin/python3
+"""Resolve MeshDirect's dedicated Alibaba Token Plan key without logging it."""
+
+import json
+import os
+import sys
+
+VAULT_PATH = "/root/vault.json"
+VAULT_ENTRY_ID = 820
+PROVIDER = "meshdirect-vault"
+ALLOWED_ID = "alibaba/token-plan/qwen38-preview"
+
+
+def reply(payload):
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")))
+
+
+def main():
+    try:
+        request = json.load(sys.stdin)
+    except Exception:
+        reply({"protocolVersion": 1, "values": {}, "errors": {
+            ALLOWED_ID: {"code": "INVALID_REQUEST"}
+        }})
+        return 1
+
+    ids = request.get("ids")
+    if (
+        request.get("protocolVersion") != 1
+        or request.get("provider") != PROVIDER
+        or not isinstance(ids, list)
+        or any(item != ALLOWED_ID for item in ids)
+    ):
+        reply({"protocolVersion": 1, "values": {}, "errors": {
+            str(item): {"code": "NOT_FOUND"} for item in (ids or [ALLOWED_ID])
+        }})
+        return 1
+
+    try:
+        stat = os.stat(VAULT_PATH)
+        if stat.st_uid != 0 or (stat.st_mode & 0o077):
+            raise PermissionError("vault permissions")
+        with open(VAULT_PATH, "r", encoding="utf-8") as handle:
+            vault = json.load(handle)
+        matches = [
+            entry for entry in vault.get("entries", [])
+            if entry.get("id") == VAULT_ENTRY_ID
+        ]
+        if len(matches) != 1:
+            raise LookupError("vault entry")
+        secret = str(matches[0].get("content", "")).strip()
+        if not secret.startswith("sk-sp-") or any(char.isspace() for char in secret):
+            raise ValueError("credential format")
+    except Exception:
+        reply({"protocolVersion": 1, "values": {}, "errors": {
+            item: {"code": "NOT_FOUND"} for item in ids
+        }})
+        return 1
+
+    reply({"protocolVersion": 1, "values": {item: secret for item in ids}})
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

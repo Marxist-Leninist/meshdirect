@@ -1,64 +1,18 @@
-// auth: env creds + bcrypt, persisted session store, cookie + CSRF + Origin parity
+// auth: env creds + bcrypt, in-memory session store, cookie + CSRF + Origin parity
 'use strict';
 const bcrypt = require('bcryptjs');
-const fs = require('node:fs');
-const path = require('node:path');
 const { randomToken, sha256b64url, secureEqual, parseCookies } = require('./util');
 
 class SessionStore {
-  // Sessions are keyed by sha256 of the cookie token, so the on-disk copy can
-  // never be replayed as a credential. Persisting it is what stops a restart
-  // from signing every device out.
-  constructor(ttlMs, storePath) {
+  constructor(ttlMs) {
     this.ttlMs = ttlMs;
-    this.storePath = storePath || '';
     this.sessions = new Map(); // sha256(token) -> {username, csrfToken, expiresAt}
-    // Renew at most hourly, but stay proportional for tiny TTLs in tests.
-    this.renewAfterMs = Math.min(ttlMs / 24, 60 * 60 * 1000);
-    this.saveTimer = null;
-    if (this.storePath) this.load();
     const t = setInterval(() => this.prune(), Math.min(5 * 60 * 1000, ttlMs));
     t.unref();
   }
-  load() {
-    let parsed;
-    try { parsed = JSON.parse(fs.readFileSync(this.storePath, 'utf8')); } catch { return; }
-    if (!parsed || !Array.isArray(parsed.sessions)) return;
-    const now = Date.now();
-    for (const row of parsed.sessions) {
-      if (!row || typeof row.key !== 'string' || typeof row.username !== 'string') continue;
-      if (typeof row.csrfToken !== 'string' || typeof row.expiresAt !== 'number') continue;
-      if (row.expiresAt <= now) continue;
-      this.sessions.set(row.key, {
-        username: row.username, csrfToken: row.csrfToken, expiresAt: row.expiresAt,
-      });
-    }
-  }
-  scheduleSave() {
-    if (!this.storePath || this.saveTimer) return;
-    this.saveTimer = setTimeout(() => { this.saveTimer = null; this.save(); }, 250);
-    this.saveTimer.unref();
-  }
-  save() {
-    if (!this.storePath) return;
-    const payload = { version: 1, sessions: [] };
-    for (const [key, s] of this.sessions) {
-      payload.sessions.push({ key, username: s.username, csrfToken: s.csrfToken, expiresAt: s.expiresAt });
-    }
-    const tmp = this.storePath + '.tmp';
-    try {
-      fs.mkdirSync(path.dirname(this.storePath), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
-      fs.renameSync(tmp, this.storePath);
-    } catch (e) {
-      console.error('[meshdirect] session store write failed:', e.message);
-    }
-  }
   prune() {
     const now = Date.now();
-    let removed = false;
-    for (const [k, s] of this.sessions) if (s.expiresAt <= now) { this.sessions.delete(k); removed = true; }
-    if (removed) this.scheduleSave();
+    for (const [k, s] of this.sessions) if (s.expiresAt <= now) this.sessions.delete(k);
   }
   create(username) {
     const token = randomToken(32);
@@ -68,20 +22,15 @@ class SessionStore {
       csrfToken: randomToken(24),
       expiresAt: Date.now() + this.ttlMs,
     });
-    this.scheduleSave();
     return { token, key };
   }
   get(key) {
     const s = this.sessions.get(key);
     if (!s) return null;
-    if (s.expiresAt <= Date.now()) { this.sessions.delete(key); this.scheduleSave(); return null; }
-    // Sliding expiry: a session in active use never lapses. The gate keeps a
-    // poll every few seconds from becoming a disk write every few seconds.
-    const renewed = Date.now() + this.ttlMs;
-    if (renewed - s.expiresAt >= this.renewAfterMs) { s.expiresAt = renewed; this.scheduleSave(); }
+    if (s.expiresAt <= Date.now()) { this.sessions.delete(key); return null; }
     return s;
   }
-  destroy(key) { if (this.sessions.delete(key)) this.scheduleSave(); }
+  destroy(key) { this.sessions.delete(key); }
 }
 
 function cookieFlags(config, maxAgeMs) {
@@ -93,15 +42,8 @@ function cookieFlags(config, maxAgeMs) {
   return parts.join('; ');
 }
 
-// Resolved here rather than read straight off config, so that losing the
-// config key again silently downgrades nothing.
-function resolveStorePath(config) {
-  if (config.sessionStorePath) return config.sessionStorePath;
-  return path.join(config.sessionsDir || '/opt/meshdirect/sessions', 'auth-sessions.json');
-}
-
 function initAuth(config) {
-  const store = new SessionStore(config.sessionTtlMs, resolveStorePath(config));
+  const store = new SessionStore(config.sessionTtlMs);
 
   function sessionPayload(sess) {
     return {
@@ -120,7 +62,7 @@ function initAuth(config) {
   }
 
   // attach req.session (nullable) + req.sessionKey from cookie
-  function attachSession(req, res, next) {
+  function attachSession(req, _res, next) {
     const cookies = parseCookies(req.headers.cookie);
     const token = cookies[config.cookieName];
     req.sessionToken = null;
@@ -133,13 +75,6 @@ function initAuth(config) {
         req.sessionToken = token;
         req.sessionKey = key;
         req.session = sess;
-        // The store slid the session forward; push the same window to the
-        // browser so the cookie cannot expire underneath a live session.
-        const now = Date.now();
-        if (!sess.cookieAt || now - sess.cookieAt >= 60 * 60 * 1000) {
-          sess.cookieAt = now;
-          res.set('Set-Cookie', `${config.cookieName}=${encodeURIComponent(token)}; ${cookieFlags(config, config.sessionTtlMs)}`);
-        }
       }
     }
     next();
@@ -184,8 +119,7 @@ function initAuth(config) {
   }
 
   function login(req, res) {
-    // rotate: destroy any pre-existing session carried by the request (fixation).
-    // Only this browser's own session is dropped; other signed-in devices keep theirs.
+    // rotate: destroy any pre-existing session carried by the request (fixation)
     if (req.sessionKey && req.sessionKey !== 'anon') store.destroy(req.sessionKey);
     const { token } = store.create(req.body.username);
     const sess = store.get(sha256b64url(token));

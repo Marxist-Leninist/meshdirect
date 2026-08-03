@@ -8,6 +8,7 @@ const { makeLimiter, byIp, bySession } = require('./ratelimit');
 const { JobManager } = require('./jobs');
 const state = require('./state');
 const sessions = require('./sessions');
+const { ImageValidationError, normalizeImages } = require('./images');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -63,6 +64,7 @@ function createApp(config, log) {
   const historyLimiter = makeLimiter({ windowMs: 60000, max: 120, keyFn: bySession, message: 'Too many requests' });
   const pollLimiter = makeLimiter({ windowMs: 60000, max: 300, keyFn: bySession, message: 'Too many requests' });
   const stateLimiter = makeLimiter({ windowMs: 60000, max: 90, keyFn: bySession, message: 'Too many requests' });
+  const ownerKey = (req) => req.session.username;
 
   api.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -72,11 +74,14 @@ function createApp(config, log) {
   });
 
   api.post('/login', auth.requireOrigin, auth.requireJson, express.json({ limit: '32kb', strict: true }), async (req, res) => {
-    if (loginLimiter.count(byIp(req)) >= 8) return res.status(429).json({ error: 'Too many login attempts' });
+    const loginKey = byIp(req);
+    if (loginLimiter.count(loginKey) >= 8) return res.status(429).json({ error: 'Too many login attempts' });
+    // Reserve the attempt before bcrypt yields so parallel requests cannot all
+    // slip through the same pre-check.
+    loginLimiter.record(loginKey);
     const { username, password } = req.body || {};
     const ok = await auth.verifyCredentials(username, password);
     if (!ok) {
-      loginLimiter.record(byIp(req));
       return res.status(401).json({ error: 'Invalid username or password' });
     }
     auth.login(req, res);
@@ -95,13 +100,15 @@ function createApp(config, log) {
     if (!Number.isFinite(limit)) limit = 80;
     limit = Math.min(200, Math.max(1, limit));
     const messages = sessions.readMessages(config, model, 'main', limit).map((m) => ({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      timestamp: m.timestamp,
+      id: m.id, role: m.role, content: m.content, timestamp: m.timestamp,
       tools: Array.isArray(m.tools) ? m.tools : [],
-      agent: m.agent && typeof m.agent === 'object' ? m.agent : null,
-      failed: !!m.failed,
+      attachments: Array.isArray(m.attachments) ? m.attachments.map((image) => ({
+        id: image.id,
+        mimeType: image.mimeType,
+        fileName: image.fileName,
+        size: image.size,
+        url: `${config.basePath}/api/media/${encodeURIComponent(image.id)}`,
+      })) : [],
     }));
     res.json({ model, label: config.lanes[model].label, sessionId: 'main', messages });
   });
@@ -110,32 +117,73 @@ function createApp(config, log) {
     res.json(state.buildState(config, jobs, startedAt));
   });
 
+  api.get('/media/:imageId', auth.requireAuth, historyLimiter, (req, res) => {
+    const image = sessions.imageInfo(config, req.params.imageId);
+    if (!image) return res.status(404).json({ error: 'Image not found' });
+    res.set('Content-Type', image.mimeType);
+    res.set('Content-Length', String(image.size));
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.set('Content-Disposition', 'inline');
+    fs.createReadStream(image.file).pipe(res);
+  });
+
   function validChatBody(body) {
     if (!body || typeof body !== 'object') return false;
     const { message, model, sessionId } = body;
-    if (typeof message !== 'string' || message.length < 1 || message.length > 12000) return false;
-    if (message.indexOf('\\0') !== -1) return false;
+    if (typeof message !== 'string' || message.length > 12000) return false;
+    if (message.indexOf('\0') !== -1) return false;
     if (model !== 'preview' && model !== 'stable') return false;
     if (sessionId !== undefined && sessionId !== null && sessionId !== '' && sessionId !== 'main') return false;
+    if (typeof body.clientTurnId !== 'string' || !/^[A-Za-z0-9_-]{12,80}$/.test(body.clientTurnId)) return false;
+    if (!message.trim() && (!Array.isArray(body.attachments) || body.attachments.length === 0)) return false;
     return true;
   }
 
-  api.post('/chat', auth.requireOrigin, auth.requireJson, express.json({ limit: '32kb', strict: true }),
-    auth.requireAuth, auth.requireCsrf, chatLimiter, (req, res) => {
+  api.post('/chat', auth.requireOrigin, auth.requireJson, auth.requireAuth, auth.requireCsrf, chatLimiter,
+    express.json({ limit: '18mb', strict: true }), (req, res) => {
       if (!validChatBody(req.body)) return res.status(400).json({ error: 'Invalid chat request' });
       try {
-        const job = jobs.enqueue({ ownerKey: req.sessionKey, model: req.body.model, message: req.body.message });
+        const attachments = normalizeImages(req.body.attachments);
+        const message = req.body.message.trim() || 'Please analyse the attached image or images.';
+        const job = jobs.enqueue({
+          ownerKey: ownerKey(req),
+          model: req.body.model,
+          message,
+          attachments,
+          clientTurnId: req.body.clientTurnId,
+        });
         res.status(202).json({ ...jobs.publicView(job), attached: false });
       } catch (e) {
+        if (e instanceof ImageValidationError) return res.status(e.status).json({ error: e.message });
         res.status(e.status || 500).json({ error: e.message });
       }
     });
 
   const jobIdRe = /^[A-Za-z0-9_-]{32}$/;
+  const clientTurnIdRe = /^[A-Za-z0-9_-]{12,80}$/;
+
+  api.get('/chat/by-client/:clientTurnId', auth.requireAuth, pollLimiter, (req, res) => {
+    if (!clientTurnIdRe.test(req.params.clientTurnId)) {
+      return res.status(404).json({ error: 'That turn is no longer tracked' });
+    }
+    const job = jobs.getByClient(req.params.clientTurnId, ownerKey(req));
+    if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
+    res.json(jobs.publicView(job));
+  });
+
+  api.post('/chat/by-client/:clientTurnId/abort', auth.requireOrigin, auth.requireJson,
+    express.json({ limit: '32kb', strict: true }), auth.requireAuth, auth.requireCsrf, (req, res) => {
+      if (!clientTurnIdRe.test(req.params.clientTurnId)) {
+        return res.status(404).json({ error: 'That turn is no longer tracked' });
+      }
+      const job = jobs.getByClient(req.params.clientTurnId, ownerKey(req));
+      if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
+      res.json({ aborted: jobs.abortJob(job), ...jobs.publicView(job) });
+    });
 
   api.get('/chat/:jobId', auth.requireAuth, pollLimiter, (req, res) => {
     if (!jobIdRe.test(req.params.jobId)) return res.status(404).json({ error: 'That turn is no longer tracked' });
-    const job = jobs.getOwned(req.params.jobId, req.sessionKey);
+    const job = jobs.getOwned(req.params.jobId, ownerKey(req));
     if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
     res.json(jobs.publicView(job));
   });
@@ -143,7 +191,7 @@ function createApp(config, log) {
   // NEW: SSE token stream
   api.get('/chat/:jobId/stream', auth.requireAuth, pollLimiter, (req, res) => {
     if (!jobIdRe.test(req.params.jobId)) return res.status(404).json({ error: 'That turn is no longer tracked' });
-    const job = jobs.getOwned(req.params.jobId, req.sessionKey);
+    const job = jobs.getOwned(req.params.jobId, ownerKey(req));
     if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
 
     res.writeHead(200, {
@@ -156,49 +204,53 @@ function createApp(config, log) {
     const send = (event, data) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
-    const initial = jobs.publicView(job);
-    send('status', {
-      state: initial.state,
-      queuePosition: initial.queuePosition || undefined,
-      elapsedMs: initial.elapsedMs,
-      activity: initial.activity,
-      step: initial.step,
-      toolCalls: initial.toolCalls,
-    });
-    for (const tool of initial.tools || []) send('tool', { ...tool, phase: tool.phase || (tool.status === 'running' ? 'start' : 'finish') });
-
     let closed = false;
-    let ping = null;
     let unsub = () => {};
+    const ping = setInterval(() => {
+      if (!closed) res.write(': ping\n\n');
+    }, config.ssePingMs);
     const close = () => {
       if (closed) return;
       closed = true;
-      if (ping) clearInterval(ping);
+      clearInterval(ping);
       unsub();
       res.end();
     };
+    // Subscribe before taking the initial snapshot. Since this block is
+    // synchronous, a completion can no longer land between snapshot and
+    // subscription and disappear forever.
     unsub = jobs.subscribe(job, (event, data) => {
       send(event, data);
       if (event === 'done' || event === 'error') close();
     });
-    ping = setInterval(() => res.write(': ping\n\n'), config.ssePingMs);
     req.on('close', close);
-
-    // The turn may have completed before the browser attached to the stream.
-    if (initial.state === 'done') {
-      send('done', { reply: initial.reply, usage: initial.usage, elapsedMs: initial.elapsedMs, tools: initial.tools });
+    if (job.state === 'done') {
+      send('done', {
+        reply: job.reply,
+        usage: job.usage || undefined,
+        tools: job.tools,
+        elapsedMs: job.finishedAt - job.createdAt,
+      });
       close();
-    } else if (initial.state === 'error') {
-      send('error', { error: initial.error, tools: initial.tools });
-      close();
+      return;
     }
+    if (job.state === 'error') {
+      send('error', { error: job.error, status: job.status });
+      close();
+      return;
+    }
+    send('status', {
+      state: job.state,
+      queuePosition: jobs.queuePosition(job) || undefined,
+      elapsedMs: Date.now() - job.createdAt,
+    });
   });
 
   // NEW: abort a queued/running turn
   api.post('/chat/:jobId/abort', auth.requireOrigin, auth.requireJson, express.json({ limit: '32kb', strict: true }),
     auth.requireAuth, auth.requireCsrf, (req, res) => {
       if (!jobIdRe.test(req.params.jobId)) return res.status(404).json({ error: 'That turn is no longer tracked' });
-      const job = jobs.getOwned(req.params.jobId, req.sessionKey);
+      const job = jobs.getOwned(req.params.jobId, ownerKey(req));
       if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
       res.json({ aborted: jobs.abortJob(job) });
     });
@@ -257,7 +309,11 @@ function createApp(config, log) {
   app.get([`${config.basePath}/`, `${config.basePath}/index.html`], (req, res) => serveStatic(req, res, ''));
   app.get(`${config.basePath}/assets/*`, (req, res) => serveStatic(req, res, `assets/${req.params[0]}`));
   app.get('/assets/*', (req, res) => serveStatic(req, res, `assets/${req.params[0]}`));
-  app.get(`${config.basePath}/*`, (req, res) => serveStatic(req, res, '')); // SPA fallback
+  app.get(`${config.basePath}/*`, (req, res) => {
+    const extension = path.extname(req.path).toLowerCase();
+    if (extension && extension !== '.html') return res.status(404).type('text/plain').send('not found\n');
+    serveStatic(req, res, '');
+  }); // SPA fallback
 
   return { app, jobs, auth };
 }

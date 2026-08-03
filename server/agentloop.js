@@ -1,244 +1,256 @@
-// MeshDirect autonomous tool-use loop.
 'use strict';
-const { randomToken, compactOneLine } = require('./util');
+
 const modelclient = require('./modelclient');
-const { getToolDefinitions, executeTool, labelFor } = require('./toolregistry');
+const { MODEL_TOOLS, SGToolGateway, normalizeArguments } = require('./sgtools');
+const { redactSecrets, sanitizeError } = require('./util');
 
-const TEXT_TOOL_RE = /<tool_call(?:\s[^>]*)?>([\s\S]*?)<\/tool_call\s*>/gi;
+const TOOL_TAG_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+const TOOL_TAG_OPEN_RE = /<tool_call>/i;
+const TOOL_TAG_ANY_RE = /<\/?tool_call\b[^>]*>/gi;
 
-function parseTextToolCalls(text) {
-  const source = String(text || '');
+function safeJson(value, maximum = 60_000) {
+  let text;
+  try { text = JSON.stringify(value); } catch { text = JSON.stringify({ error: 'Tool result was not serializable' }); }
+  text = redactSecrets(text).replace(/\u0000/g, '');
+  if (text.length <= maximum) return text;
+  const half = Math.max(1_000, Math.floor((maximum - 100) / 2));
+  return `${text.slice(0, half)}\n...[tool result truncated ${text.length - half * 2} chars]...\n${text.slice(-half)}`;
+}
+
+function parseJsonObject(raw) {
+  let text = String(raw || '').trim();
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last >= first) text = text.slice(first, last + 1);
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseTextToolCalls(content) {
+  if (typeof content !== 'string' || !TOOL_TAG_OPEN_RE.test(content)) {
+    const residual = String(content || '').replace(TOOL_TAG_ANY_RE, '');
+    return { calls: [], residual, rawResidual: residual, malformed: false };
+  }
+  TOOL_TAG_RE.lastIndex = 0;
   const calls = [];
+  let malformed = false;
+  let matched = false;
+  let residual = '';
+  let cursor = 0;
   let match;
-  TEXT_TOOL_RE.lastIndex = 0;
-  while ((match = TEXT_TOOL_RE.exec(source)) !== null) {
-    const raw = match[1].trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-    let parsed;
-    try { parsed = JSON.parse(raw); } catch { continue; }
-    const fn = parsed && parsed.function && typeof parsed.function === 'object' ? parsed.function : parsed;
-    const name = fn && typeof fn.name === 'string' ? fn.name : '';
-    if (!name) continue;
-    let args = fn.arguments != null ? fn.arguments : parsed.arguments;
-    if (args == null) args = {};
-    if (typeof args !== 'string') args = JSON.stringify(args);
-    calls.push({
-      id: parsed.id || `call_text_${randomToken(8)}`,
-      type: 'function',
-      function: { name, arguments: args },
-      textual: true,
-    });
-  }
-  const visible = calls.length ? source.replace(TEXT_TOOL_RE, '').replace(/<tool_calls?>|<\/tool_calls?>/gi, '').trim() : source;
-  return { calls, visible };
-}
-
-function normalizeNativeCalls(calls) {
-  if (!Array.isArray(calls)) return [];
-  return calls.map((call, index) => ({
-    id: call && call.id ? String(call.id) : `call_native_${randomToken(8)}_${index}`,
-    type: 'function',
-    function: {
-      name: call && call.function && call.function.name ? String(call.function.name) : '',
-      arguments: call && call.function && call.function.arguments != null ? String(call.function.arguments) : '{}',
-    },
-  })).filter((call) => call.function.name);
-}
-
-function createStreamingGuard(onDelta) {
-  let raw = '';
-  let emitted = 0;
-  const guardChars = 96;
-
-  function push(text) {
-    raw += String(text || '');
-    const lower = raw.toLowerCase();
-    const tagAt = lower.indexOf('<tool_call');
-    const safeEnd = tagAt >= 0
-      ? raw.slice(0, tagAt).trimEnd().length
-      : Math.max(emitted, raw.length - guardChars);
-    if (safeEnd > emitted) {
-      onDelta(raw.slice(emitted, safeEnd));
-      emitted = safeEnd;
+  while ((match = TOOL_TAG_RE.exec(content)) !== null) {
+    matched = true;
+    residual += content.slice(cursor, match.index);
+    cursor = match.index + match[0].length;
+    const value = parseJsonObject(match[1]);
+    if (!value || typeof value.name !== 'string' || !value.name.trim()) {
+      malformed = true;
+      continue;
     }
+    calls.push({ name: value.name.trim(), arguments: normalizeArguments(value.arguments) });
   }
-
-  function finish(visible, hasTextualTools) {
-    const target = String(visible || '');
-    if (!hasTextualTools) {
-      if (raw.length > emitted) onDelta(raw.slice(emitted));
-      emitted = raw.length;
-      return;
-    }
-    // Text before the first XML tool block is a prefix of visible and may have streamed.
-    const alreadyVisible = Math.min(emitted, target.length);
-    if (target.length > alreadyVisible) onDelta(target.slice(alreadyVisible));
-    emitted = raw.length;
+  residual += content.slice(cursor);
+  if (!matched) {
+    malformed = true;
+    residual = content.slice(0, content.search(TOOL_TAG_OPEN_RE));
+  } else if (TOOL_TAG_OPEN_RE.test(residual)) {
+    malformed = true;
+    residual = residual.slice(0, residual.search(TOOL_TAG_OPEN_RE));
   }
-
-  return { push, finish, raw: () => raw };
+  residual = residual.replace(TOOL_TAG_ANY_RE, '');
+  return { calls, residual: residual.trim(), rawResidual: residual, malformed };
 }
 
-function assistantToolMessage(content, calls) {
+function parseNativeToolCalls(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((call, index) => {
+    const fn = call && call.function && typeof call.function === 'object' ? call.function : {};
+    const name = typeof fn.name === 'string' ? fn.name.trim() : '';
+    if (!name) return [];
+    return [{
+      id: typeof call.id === 'string' && call.id ? call.id : `call-${index + 1}`,
+      name,
+      arguments: normalizeArguments(fn.arguments),
+    }];
+  });
+}
+
+function routeToolCall(call, index) {
+  let name = call.name;
+  let args = normalizeArguments(call.arguments);
+  if (name === 'exec') {
+    name = 'sg1';
+    // Only a valid JSON object can be promoted to a legacy shell call. A
+    // malformed argument payload remains invalid and the gateway rejects it.
+    if (args) args = { action: 'call', name: 'shell', arguments: args };
+  } else if (name !== 'sg1' && name !== 'sg2') {
+    // A hallucinated direct function name must never become an accidental
+    // no-argument call. Convert it into safe discovery; the next round can
+    // invoke the exact SG tool deliberately.
+    args = { action: 'search', query: name, limit: 12 };
+    name = 'sg1';
+  }
   return {
-    role: 'assistant',
-    content: content || null,
-    tool_calls: calls.map((call) => ({
-      id: call.id,
-      type: 'function',
-      function: { name: call.function.name, arguments: call.function.arguments || '{}' },
-    })),
+    id: call.id || `call-${Date.now()}-${index + 1}`,
+    name,
+    arguments: args,
   };
 }
 
-function joinReply(current, next) {
-  const a = String(current || '').trimEnd();
-  const b = String(next || '').trim();
-  if (!b) return a;
-  if (!a) return b;
-  return `${a}\n\n${b}`;
+function toolLabel(call) {
+  const args = call.arguments || {};
+  const action = args.action;
+  if (action === 'search') {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    return `${call.name.toUpperCase()} tool search${query ? `: ${query.slice(0, 80)}` : ''}`;
+  }
+  const target = typeof args.name === 'string' ? args.name : 'invalid request';
+  return `${call.name.toUpperCase()} · ${target.slice(0, 120)}`;
 }
 
-async function runAgent(config, model, initialMessages, hooks = {}) {
-  const tools = getToolDefinitions();
-  const messages = initialMessages.map((m) => ({ ...m }));
-  const toolHistory = [];
-  const signatureCounts = new Map();
-  let combinedReply = '';
-  let finalUsage = null;
-  let provider = null;
-  let totalToolCalls = 0;
-  let reasoningChars = 0;
+function addUsage(total, usage) {
+  if (!usage || typeof usage !== 'object') return;
+  for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
+    const value = Number(usage[key]);
+    if (Number.isFinite(value) && value > 0) total[key] += value;
+  }
+}
 
-  for (let step = 1; step <= config.maxAgentSteps; step += 1) {
-    if (hooks.signal && hooks.signal.aborted) { const e = new Error('aborted'); e.status = 499; throw e; }
-    if (hooks.onProgress) hooks.onProgress({ phase: 'model', activity: 'thinking', step, totalToolCalls });
+class AgentLoop {
+  constructor(config, log = () => {}, dependencies = {}) {
+    this.config = config;
+    this.log = log;
+    this.modelclient = dependencies.modelclient || modelclient;
+    this.gateway = dependencies.gateway || new SGToolGateway(config, log);
+  }
 
-    const guard = createStreamingGuard((text) => {
-      if (!text) return;
-      if (hooks.onDelta) hooks.onDelta(text);
-    });
+  async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta }) {
+    const transcript = messages.map((message) => ({ ...message }));
+    const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    const tools = [];
+    const answerParts = [];
+    let toolCount = 0;
+    let lastProvider = '';
 
-    const output = await modelclient.runChat(config, config.lanes[model].modelId, messages, {
-      signal: hooks.signal,
-      tools,
-      onDelta: guard.push,
-      onReasoning: (count) => {
-        reasoningChars += count;
-        if (hooks.onProgress) hooks.onProgress({ phase: 'model', activity: 'reasoning', step, totalToolCalls, reasoningChars });
-      },
-      onToolDelta: () => {
-        if (hooks.onProgress) hooks.onProgress({ phase: 'model', activity: 'preparing tool call', step, totalToolCalls });
-      },
-      onProviderError: hooks.onProviderError,
-    });
-    provider = output.provider || provider;
-    finalUsage = output.usage || finalUsage;
+    const activity = (value) => { if (onActivity) onActivity(value); };
 
-    const rawText = guard.raw();
-    const textual = parseTextToolCalls(rawText);
-    const nativeCalls = normalizeNativeCalls(output.toolCalls);
-    const calls = nativeCalls.length ? nativeCalls : textual.calls;
-    const visible = textual.calls.length ? textual.visible : rawText;
-    guard.finish(visible, textual.calls.length > 0);
-    combinedReply = joinReply(combinedReply, visible);
+    for (let round = 1; round <= this.config.maxAgentRounds; round += 1) {
+      if (signal && signal.aborted) {
+        const error = new Error('aborted');
+        error.status = 499;
+        throw error;
+      }
+      activity({ phase: 'model', status: 'running', label: 'Qwen is deciding the next step', round });
+      const output = await this.modelclient.runChat(this.config, modelId, transcript, {
+        signal,
+        tools: MODEL_TOOLS,
+        onProviderError,
+      });
+      lastProvider = output.provider || lastProvider;
+      addUsage(usage, output.usage);
 
-    if (!calls.length) {
-      if (hooks.onProgress) hooks.onProgress({ phase: 'complete', activity: 'done', step, totalToolCalls });
-      return {
-        reply: combinedReply,
-        usage: finalUsage,
-        provider,
-        tools: toolHistory,
-        steps: step,
-        toolCalls: totalToolCalls,
-        reasoningChars,
-      };
-    }
+      let calls = parseNativeToolCalls(output.toolCalls);
+      const textFallback = parseTextToolCalls(output.reply || '');
+      if (!calls.length && textFallback.calls.length) {
+        calls = textFallback.calls.map((call, index) => ({ ...call, id: `text-call-${round}-${index + 1}` }));
+      }
 
-    messages.push(assistantToolMessage(visible, calls));
-
-    for (const call of calls.slice(0, config.maxToolCallsPerStep)) {
-      if (totalToolCalls >= config.maxToolCallsPerTurn) {
-        messages.push({
-          role: 'tool', tool_call_id: call.id, name: call.function.name,
-          content: JSON.stringify({ ok: false, error: `Tool call limit ${config.maxToolCallsPerTurn} reached. Finish the task with the available results.` }),
+      const finishReason = typeof output.finishReason === 'string'
+        ? output.finishReason.toLowerCase()
+        : '';
+      if (finishReason === 'content_filter') {
+        throw new modelclient.ProviderError('Provider blocked the response with content_filter', 502, false);
+      }
+      if (finishReason === 'length') {
+        // Never execute a call from a truncated pass: its arguments may only
+        // look valid while missing a suffix. Preserve clean prose continuations
+        // and ask the model to regenerate any intended function call in full.
+        const cleanPartial = String(textFallback.rawResidual || '');
+        const hasToolAttempt = calls.length > 0 || textFallback.malformed || textFallback.calls.length > 0;
+        if (!hasToolAttempt && cleanPartial) answerParts.push(cleanPartial);
+        transcript.push({ role: 'assistant', content: cleanPartial.trim() || '(response truncated)' });
+        transcript.push({
+          role: 'user',
+          content: hasToolAttempt
+            ? 'The previous response was truncated. Do not continue or reuse its partial tool call. Issue a complete supplied sg1 or sg2 function call from scratch, or return the final answer as plain text.'
+            : 'Continue the answer exactly where it was truncated. Do not repeat completed text and do not print tool markup.',
         });
+        activity({ phase: 'model', status: 'retrying', label: 'Qwen response was truncated; continuing', round });
         continue;
       }
-      if (hooks.signal && hooks.signal.aborted) { const e = new Error('aborted'); e.status = 499; throw e; }
 
-      totalToolCalls += 1;
-      const signature = `${call.function.name}:${compactOneLine(call.function.arguments, 2000)}`;
-      const repeated = (signatureCounts.get(signature) || 0) + 1;
-      signatureCounts.set(signature, repeated);
-
-      let parsedArgs = {};
-      try { parsedArgs = JSON.parse(call.function.arguments || '{}'); } catch { /* executor reports malformed JSON */ }
-      const label = labelFor(call.function.name, parsedArgs);
-      const activity = {
-        id: call.id,
-        name: call.function.name,
-        label,
-        status: 'running',
-        step,
-        sequence: totalToolCalls,
-        arguments: compactOneLine(call.function.arguments || '{}', 500),
-        summary: '',
-        durationMs: null,
-      };
-      toolHistory.push(activity);
-      if (hooks.onTool) hooks.onTool({ ...activity, phase: 'start' });
-      if (hooks.onProgress) hooks.onProgress({ phase: 'tool', activity: `running ${label}`, step, totalToolCalls, currentTool: call.function.name });
-
-      let result;
-      if (repeated > config.maxIdenticalToolCalls) {
-        result = {
-          name: call.function.name,
-          label,
-          ok: false,
-          content: JSON.stringify({ ok: false, error: `Identical tool call repeated ${repeated} times; blocked to prevent a loop.` }),
-          summary: 'repeated tool call blocked',
-          durationMs: 0,
-          arguments: activity.arguments,
-        };
-      } else {
-        result = await executeTool(config, model, call, { signal: hooks.signal });
+      if (!calls.length && textFallback.malformed) {
+        transcript.push({ role: 'assistant', content: textFallback.residual || '(attempted a tool call)' });
+        transcript.push({
+          role: 'user',
+          content: 'Your tool call was malformed and was not executed. Use the supplied sg1 or sg2 function tool with valid JSON arguments. Do not print tool markup.',
+        });
+        activity({ phase: 'model', status: 'retrying', label: 'Qwen produced a malformed tool request; retrying', round });
+        continue;
       }
 
-      activity.status = result.ok ? 'done' : 'error';
-      activity.summary = result.summary;
-      activity.durationMs = result.durationMs;
-      activity.truncated = !!result.truncated;
-      if (hooks.onTool) hooks.onTool({ ...activity, phase: 'finish' });
-      if (hooks.onProgress) hooks.onProgress({ phase: 'tool', activity: `${result.ok ? 'completed' : 'failed'} ${label}`, step, totalToolCalls, currentTool: null });
+      if (!calls.length) {
+        const finalPart = String(textFallback.rawResidual || '');
+        const reply = `${answerParts.join('')}${finalPart}`.trim();
+        if (!reply) {
+          transcript.push({ role: 'assistant', content: '(empty response)' });
+          transcript.push({ role: 'user', content: 'Return the completed answer as plain text.' });
+          continue;
+        }
+        if (onFinalDelta) onFinalDelta(reply);
+        activity({ phase: 'complete', status: 'complete', label: 'Reply complete', round });
+        return { reply, usage, tools, rounds: round, provider: lastProvider };
+      }
 
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        name: call.function.name,
-        content: String(result.content || '').slice(0, config.toolContextMaxChars),
+      if (toolCount + calls.length > this.config.maxToolCalls) {
+        throw new Error(`Agent exceeded the ${this.config.maxToolCalls} tool-call limit`);
+      }
+      const routed = calls.map(routeToolCall);
+      transcript.push({
+        role: 'assistant',
+        content: textFallback.residual || null,
+        tool_calls: routed.map((call) => ({
+          id: call.id,
+          type: 'function',
+          function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+        })),
       });
-    }
-  }
 
-  // The model exhausted the configured loop. Preserve useful streamed text and make the limit explicit.
-  const limitText = `Agent stopped after ${config.maxAgentSteps} model steps to prevent an infinite loop.`;
-  if (hooks.onDelta) hooks.onDelta(`${combinedReply ? '\n\n' : ''}${limitText}`);
-  return {
-    reply: joinReply(combinedReply, limitText),
-    usage: finalUsage,
-    provider,
-    tools: toolHistory,
-    steps: config.maxAgentSteps,
-    toolCalls: totalToolCalls,
-    reasoningChars,
-    limitReached: true,
-  };
+      for (const call of routed) {
+        toolCount += 1;
+        const label = toolLabel(call);
+        const record = { label, status: 'running', time: new Date().toISOString() };
+        tools.push(record);
+        activity({ phase: 'tool', status: 'running', label, tool: label, round, toolCount });
+        let result;
+        try {
+          const value = await this.gateway.execute(call.name, call.arguments, { signal });
+          result = safeJson({ ok: true, ...value }, this.config.maxToolResultChars);
+          record.status = 'complete';
+          activity({ phase: 'tool', status: 'complete', label, tool: label, round, toolCount });
+        } catch (error) {
+          if (signal && signal.aborted) throw error;
+          const message = sanitizeError(error && error.message);
+          result = safeJson({ ok: false, error: message }, this.config.maxToolResultChars);
+          record.status = 'error';
+          activity({ phase: 'tool', status: 'error', label, tool: label, error: message, round, toolCount });
+        }
+        transcript.push({ role: 'tool', tool_call_id: call.id, content: result });
+      }
+    }
+    throw new Error(`Agent reached ${this.config.maxAgentRounds} model rounds without a final answer`);
+  }
 }
 
 module.exports = {
-  runAgent,
+  AgentLoop,
+  parseNativeToolCalls,
   parseTextToolCalls,
-  normalizeNativeCalls,
-  createStreamingGuard,
+  routeToolCall,
+  safeJson,
 };
