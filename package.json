@@ -1,0 +1,17 @@
+{
+  "name": "meshdirect",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenClaw-free qwen38 chat backend (drop-in replacement)",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "express": "^4.21.2"
+  }
+}

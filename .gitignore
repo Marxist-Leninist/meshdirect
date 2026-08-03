@@ -1,0 +1,6 @@
+node_modules/
+sessions/*.jsonl
+sessions/.imported
+*.log
+sessions/.test-cookies
+scripts/.*
