@@ -86,12 +86,18 @@ class ProviderError extends Error {
 function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
   return new Promise((resolve, reject) => {
     const url = new URL(provider.baseUrl.replace(/\/+$/, '') + '/chat/completions');
+    const toolCalls = [];
     const body = JSON.stringify({
       model: modelId,
       messages,
       stream: true,
       max_tokens: config.maxOutputTokens,
       stream_options: { include_usage: true },
+      // Without these the model has no way to act, so it narrates a tool call
+      // as prose instead of making one.
+      ...(opts.tools && opts.tools.length
+        ? { tools: opts.tools, tool_choice: opts.toolChoice || 'auto' }
+        : {}),
     });
     const headers = {
       'Content-Type': 'application/json',
@@ -154,6 +160,22 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
         reply += text;
         opts.onDelta(text);
       }
+      const calls = delta && delta.tool_calls;
+      if (Array.isArray(calls)) {
+        gotDelta = true;
+        for (const part of calls) {
+          const at = typeof part.index === 'number' ? part.index : toolCalls.length;
+          if (!toolCalls[at]) {
+            toolCalls[at] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+          }
+          const slot = toolCalls[at];
+          if (part.id) slot.id = part.id;
+          if (part.function && part.function.name) slot.function.name += part.function.name;
+          if (part.function && typeof part.function.arguments === 'string') {
+            slot.function.arguments += part.function.arguments;
+          }
+        }
+      }
     };
 
     connectSocket(config, url, (err, socket) => {
@@ -195,7 +217,7 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
         });
         r.on('end', () => {
           if (lineBuf.trim()) handleLine(lineBuf.replace(/\r$/, ''));
-          done({ reply, usage });
+          done({ reply, usage, toolCalls: toolCalls.filter(Boolean) });
         });
         r.on('error', (e) => fail(new ProviderError(`stream error: ${e.message}`, 502, !gotDelta)));
       });

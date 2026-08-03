@@ -3,6 +3,7 @@
 const { randomToken, sanitizeError, classifyStatus } = require('./util');
 const sessions = require('./sessions');
 const modelclient = require('./modelclient');
+const agentloop = require('./agentloop');
 
 const JOB_STATES = { QUEUED: 'queued', RUNNING: 'running', DONE: 'done', ERROR: 'error' };
 
@@ -135,24 +136,45 @@ class JobManager {
         messages.push({ role: m.role, content: m.content });
         chars += m.content.length;
       }
-      const out = await modelclient.runChat(cfg, cfg.lanes[job.model].modelId, messages, {
-        signal: ac.signal,
-        onDelta: (text) => {
-          live.lastActivity = 'writing';
+      // Every turn runs through the tool loop. Without tools in the request
+      // the model has no way to act, so it narrates a tool call as prose --
+      // which is exactly the "<tool_call>" text the transcript used to show.
+      const out = await agentloop.runAgentTurn({
+        messages,
+        shouldStop: () => ac.signal.aborted,
+        onProgress: (p) => {
+          live.lastActivity = p.lastTool ? `tool: ${p.lastTool}` : 'thinking';
           live.lastActivityAt = Date.now();
-          job.reply += text;
-          this._emit(job, 'delta', { text });
+          live.steps = p.step;
+          live.toolCalls = p.toolCalls;
+          this._emit(job, 'progress', p);
         },
-        onProviderError: (provider, status, msg) => {
-          live.providerErrors += 1;
-          live.latestError = msg;
-          live.lastActivity = 'retrying';
-          this.log(`provider error [${job.model}/${provider}] HTTP ${status}: ${msg}`);
+        callModel: (thread, opts) => {
+          // Each step streams fresh text; only the final step's prose is the
+          // answer, so reset rather than concatenating intermediate reasoning.
+          job.reply = '';
+          this._emit(job, 'reset', {});
+          return modelclient.runChat(cfg, cfg.lanes[job.model].modelId, thread, {
+            tools: opts.tools,
+            signal: ac.signal,
+            onDelta: (text) => {
+              live.lastActivity = 'writing';
+              live.lastActivityAt = Date.now();
+              job.reply += text;
+              this._emit(job, 'delta', { text });
+            },
+            onProviderError: (provider, status, msg) => {
+              live.providerErrors += 1;
+              live.latestError = msg;
+              live.lastActivity = 'retrying';
+              this.log(`provider error [${job.model}/${provider}] HTTP ${status}: ${msg}`);
+            },
+          });
         },
       });
       clearTimeout(turnCap);
       job.reply = out.reply;
-      job.usage = out.usage || null;
+      job.usage = out.usage || (out.tokens ? { total_tokens: out.tokens } : null);
       job.state = JOB_STATES.DONE;
       job.finishedAt = Date.now();
       live.lastActivity = 'waiting';
