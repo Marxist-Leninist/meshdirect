@@ -20,7 +20,9 @@ const image = normalizeImages([{
   fileName: path.basename(file), mimeType, content: data.toString('base64'),
 }])[0];
 const controller = new AbortController();
-const timer = setTimeout(() => controller.abort(), config.turnTimeoutMs);
+const timer = Number(config.turnTimeoutMs) > 0
+  ? setTimeout(() => controller.abort(), config.turnTimeoutMs)
+  : null;
 
 (async () => {
   const loop = new AgentLoop(config, (message) => process.stderr.write(`[log] ${message}\n`));
@@ -52,4 +54,4 @@ const timer = setTimeout(() => controller.abort(), config.turnTimeoutMs);
 })().catch((error) => {
   process.stderr.write(`vision smoke failed: ${error.message}\n`);
   process.exitCode = 1;
-}).finally(() => clearTimeout(timer));
+}).finally(() => { if (timer) clearTimeout(timer); });

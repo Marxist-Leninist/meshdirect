@@ -12,7 +12,9 @@ const prompt = process.argv.slice(3).join(' ') || [
 ].join(' ');
 
 const controller = new AbortController();
-const timer = setTimeout(() => controller.abort(), config.turnTimeoutMs);
+const timer = Number(config.turnTimeoutMs) > 0
+  ? setTimeout(() => controller.abort(), config.turnTimeoutMs)
+  : null;
 
 (async () => {
   const events = [];
@@ -46,4 +48,4 @@ const timer = setTimeout(() => controller.abort(), config.turnTimeoutMs);
 })().catch((error) => {
   process.stderr.write(`smoke failed: ${error.message}\n`);
   process.exitCode = 1;
-}).finally(() => clearTimeout(timer));
+}).finally(() => { if (timer) clearTimeout(timer); });

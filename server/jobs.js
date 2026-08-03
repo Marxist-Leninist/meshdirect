@@ -190,7 +190,9 @@ class JobManager {
 
     const ac = new AbortController();
     job.abort = ac;
-    const turnCap = setTimeout(() => ac.abort(new Error('turn cap exceeded')), cfg.turnTimeoutMs);
+    const turnCap = Number(cfg.turnTimeoutMs) > 0
+      ? setTimeout(() => ac.abort(new Error('turn cap exceeded')), cfg.turnTimeoutMs)
+      : null;
 
     let userRow = null;
     let savedAttachments = [];

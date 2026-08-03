@@ -70,8 +70,10 @@ const config = {
   systemPrompt: env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
   historyContextMessages: int(env.HISTORY_CONTEXT_MESSAGES, 50),
   historyContextMaxChars: int(env.HISTORY_CONTEXT_MAX_CHARS, 200000),
-  maxAgentRounds: int(env.MAX_AGENT_ROUNDS, 12),
-  maxToolCalls: int(env.MAX_TOOL_CALLS, 32),
+  // Zero means the harness does not impose an execution cap. A turn remains
+  // explicitly stoppable through its AbortController.
+  maxAgentRounds: int(env.MAX_AGENT_ROUNDS, 0),
+  maxToolCalls: int(env.MAX_TOOL_CALLS, 0),
   maxToolResultChars: int(env.MAX_TOOL_RESULT_CHARS, 60000),
   sgCallTimeoutMs: int(env.SG_CALL_TIMEOUT_MS, 150000),
   sgCatalogTtlMs: int(env.SG_CATALOG_TTL_MS, 60000),
@@ -79,7 +81,7 @@ const config = {
   // timeouts
   connectTimeoutMs: int(env.CONNECT_TIMEOUT_MS, 10000),
   stallTimeoutMs: int(env.STALL_TIMEOUT_MS, 60000),
-  turnTimeoutMs: int(env.TURN_TIMEOUT_MS, 600000),
+  turnTimeoutMs: int(env.TURN_TIMEOUT_MS, 0),
 
   // storage
   sessionsDir: env.SESSIONS_DIR || '/opt/meshdirect/sessions',

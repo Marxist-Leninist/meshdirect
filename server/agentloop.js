@@ -139,7 +139,8 @@ class AgentLoop {
 
     const activity = (value) => { if (onActivity) onActivity(value); };
 
-    for (let round = 1; round <= this.config.maxAgentRounds; round += 1) {
+    const maxRounds = Number(this.config.maxAgentRounds) > 0 ? Number(this.config.maxAgentRounds) : Infinity;
+    for (let round = 1; round <= maxRounds; round += 1) {
       if (signal && signal.aborted) {
         const error = new Error('aborted');
         error.status = 499;
@@ -208,8 +209,9 @@ class AgentLoop {
         return { reply, usage, tools, rounds: round, provider: lastProvider };
       }
 
-      if (toolCount + calls.length > this.config.maxToolCalls) {
-        throw new Error(`Agent exceeded the ${this.config.maxToolCalls} tool-call limit`);
+      const maxToolCalls = Number(this.config.maxToolCalls);
+      if (maxToolCalls > 0 && toolCount + calls.length > maxToolCalls) {
+        throw new Error(`Agent exceeded the ${maxToolCalls} tool-call limit`);
       }
       const routed = calls.map(routeToolCall);
       transcript.push({
@@ -244,7 +246,7 @@ class AgentLoop {
         transcript.push({ role: 'tool', tool_call_id: call.id, content: result });
       }
     }
-    throw new Error(`Agent reached ${this.config.maxAgentRounds} model rounds without a final answer`);
+    throw new Error(`Agent reached ${maxRounds} model rounds without a final answer`);
   }
 }
 

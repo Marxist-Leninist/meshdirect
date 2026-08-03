@@ -112,3 +112,23 @@ test('client turn id remains idempotent after a manager restart', async (t) => {
   assert.equal(restarted.getByClient('turn_durable_1234', 'user').reply, 'durable reply');
   assert.equal(calls, 1);
 });
+
+test('zero turn timeout leaves the turn running until completion', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meshdirect-unlimited-turn-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const cfg = { ...config(directory), turnTimeoutMs: 0 };
+  const manager = new JobManager(cfg, () => {}, {
+    agent: {
+      async run() {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return { reply: 'completed without a harness deadline', usage: null, tools: [] };
+      },
+    },
+  });
+  const job = manager.enqueue({
+    ownerKey: 'owner', model: 'preview', message: 'keep going', clientTurnId: 'turn_unlimited_1234',
+  });
+  await waitForTerminal(manager, job);
+  assert.equal(job.state, 'done');
+  assert.equal(job.reply, 'completed without a harness deadline');
+});

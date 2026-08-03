@@ -236,3 +236,39 @@ test('content_filter is a terminal provider error', async () => {
     (error) => error.status === 502 && /content_filter/.test(error.message),
   );
 });
+
+test('zero round and tool-call limits keep running until the agent completes', async () => {
+  let modelCalls = 0;
+  let toolCalls = 0;
+  const unlimited = { ...config(), maxAgentRounds: 0, maxToolCalls: 0 };
+  const loop = new AgentLoop(unlimited, () => {}, {
+    modelclient: {
+      async runChat() {
+        modelCalls += 1;
+        if (modelCalls <= 12) {
+          return {
+            reply: '',
+            toolCalls: [{
+              id: `call-${modelCalls}`,
+              type: 'function',
+              function: { name: 'sg1', arguments: '{"action":"search","query":"health"}' },
+            }],
+            usage: {},
+            provider: 'test',
+          };
+        }
+        return { reply: 'Verified complete.', toolCalls: [], usage: {}, provider: 'test' };
+      },
+    },
+    gateway: {
+      async execute() {
+        toolCalls += 1;
+        return { result: 'healthy' };
+      },
+    },
+  });
+  const result = await loop.run({ modelId: 'qwen-test', messages: [{ role: 'user', content: 'own this goal' }] });
+  assert.equal(result.reply, 'Verified complete.');
+  assert.equal(result.rounds, 13);
+  assert.equal(toolCalls, 12);
+});
