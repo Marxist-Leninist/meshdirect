@@ -1,267 +1,369 @@
-// warm in-process model client: streaming OpenAI-compatible chat over corporate proxy,
-// runtime key resolution (token-plan vault resolver) + free-pool fallback. Memory-only keys.
+// Warm in-process OpenAI-compatible model client with native function calling.
+// MeshDirect owns the loop; no OpenClaw process or protocol is involved.
 'use strict';
 const fs = require('fs');
 const net = require('net');
 const tls = require('tls');
-const http = require('http');
 const https = require('https');
 const { execFile } = require('child_process');
 const { sanitizeError } = require('./util');
 
-// --- key management (never written to disk or logs) ---------------------------
 let primaryKey = null;
 let fallbackKey = null;
 
 function resolvePrimaryKey(config, force) {
   if (primaryKey && !force) return Promise.resolve(primaryKey);
-  const input = JSON.stringify({ protocolVersion: 1, provider: 'sg1vault', ids: [config.providers.primary.resolverId] });
+  const providerId = config.providers.primary.resolverProvider || 'meshdirect-vault';
+  const input = JSON.stringify({ protocolVersion: 1, provider: providerId, ids: [config.providers.primary.resolverId] });
   return new Promise((resolve, reject) => {
-    const child = execFile(config.providers.primary.resolverPath, [], { timeout: 15000, maxBuffer: 64 * 1024 }, (err, stdout) => {
+    const child = execFile(config.providers.primary.resolverPath, [], {
+      timeout: 15000,
+      maxBuffer: 64 * 1024,
+      env: { PATH: process.env.PATH || '/usr/bin:/bin', LANG: 'C.UTF-8' },
+    }, (err, stdout) => {
       let out = null;
-      try { out = JSON.parse(stdout || '{}'); } catch { /* fall through */ }
+      try { out = JSON.parse(stdout || '{}'); } catch { /* handled below */ }
       const key = out && out.values && out.values[config.providers.primary.resolverId];
-      if (typeof key === 'string' && key.length > 8) { primaryKey = key; resolve(key); }
-      else reject(new Error(`key resolver failed: ${err ? err.message : 'empty values'}`));
+      if (typeof key === 'string' && key.length > 8) {
+        primaryKey = key;
+        resolve(key);
+      } else {
+        reject(new Error(`key resolver failed: ${err ? err.message : 'empty values'}`));
+      }
     });
+    child.on('error', reject);
     child.stdin.end(input);
   });
 }
 
 function loadFallbackKey(config, log) {
+  fallbackKey = null;
+  const file = config.providers.fallback.keyFile;
+  if (!file) { log('fallback provider disabled: no key file configured'); return; }
   try {
-    const raw = JSON.parse(fs.readFileSync(config.providers.fallback.openclawConfig, 'utf8'));
-    const key = raw && raw.models && raw.models.providers &&
-      raw.models.providers.alibaba_free_ws && raw.models.providers.alibaba_free_ws.apiKey;
-    if (typeof key === 'string' && key.length > 8) { fallbackKey = key; log('fallback free-pool key loaded into memory'); }
-    else log('WARN: fallback free-pool key not found in openclaw.json');
-  } catch (e) { log(`WARN: cannot read fallback key: ${e.message}`); }
+    const st = fs.statSync(file);
+    if (st.uid !== 0 || (st.mode & 0o077)) throw new Error('unsafe fallback key permissions');
+    const key = fs.readFileSync(file, 'utf8').trim();
+    if (key.length > 8 && !/\s/.test(key)) {
+      fallbackKey = key;
+      log('fallback provider key loaded into memory');
+    } else {
+      log('WARN: fallback provider key file has an invalid format');
+    }
+  } catch (e) {
+    log(`WARN: cannot load fallback provider key: ${sanitizeError(e.message)}`);
+  }
 }
 
-// --- proxy transport ----------------------------------------------------------
 function hostInNoProxy(config, host) {
-  return config.noProxy.some((p) => p && (host === p || (p.startsWith('.') && host.endsWith(p))));
+  return config.noProxy.some((entry) => {
+    const p = String(entry || '').trim();
+    return p && (host === p || (p.startsWith('.') && host.endsWith(p)));
+  });
 }
 
-// open a TLS socket to target, via HTTP CONNECT proxy when configured
 function connectSocket(config, url, cb) {
   let called = false;
   const once = (err, sock) => { if (!called) { called = true; cb(err, sock); } };
   const direct = () => {
-    const s = tls.connect({ host: url.hostname, port: 443, servername: url.hostname }, () => once(null, s));
-    s.once('error', (e) => once(e));
+    const socket = tls.connect({ host: url.hostname, port: Number(url.port || 443), servername: url.hostname }, () => once(null, socket));
+    socket.once('error', (e) => once(e));
   };
   if (!config.httpsProxy || hostInNoProxy(config, url.hostname)) return direct();
-  let pu;
-  try { pu = new URL(config.httpsProxy); } catch { return direct(); }
-  const sock = net.connect(parseInt(pu.port || '8080', 10), pu.hostname, () => {
-    sock.write(`CONNECT ${url.hostname}:443 HTTP/1.1\r\nHost: ${url.hostname}:443\r\n\r\n`);
+
+  let proxy;
+  try { proxy = new URL(config.httpsProxy); }
+  catch { return direct(); }
+  const socket = net.connect(Number(proxy.port || 8080), proxy.hostname, () => {
+    socket.write(`CONNECT ${url.hostname}:${url.port || 443} HTTP/1.1\r\nHost: ${url.hostname}:${url.port || 443}\r\nConnection: keep-alive\r\n\r\n`);
   });
-  let buf = '';
+  let buffer = '';
   const onData = (chunk) => {
-    buf += chunk.toString('latin1');
-    const end = buf.indexOf('\r\n\r\n');
+    buffer += chunk.toString('latin1');
+    const end = buffer.indexOf('\r\n\r\n');
     if (end < 0) {
-      if (buf.length > 8192) { sock.destroy(); cb(new Error('proxy CONNECT response too large')); }
+      if (buffer.length > 8192) { socket.destroy(); once(new Error('proxy CONNECT response too large')); }
       return;
     }
-    sock.removeListener('data', onData);
-    const statusLine = buf.slice(0, buf.indexOf('\r\n'));
-    if (!/^HTTP\/1\.[01] 200/.test(statusLine)) {
-      sock.destroy();
-      return once(new Error(`proxy CONNECT failed: ${statusLine}`));
+    socket.removeListener('data', onData);
+    const statusLine = buffer.slice(0, buffer.indexOf('\r\n'));
+    if (!/^HTTP\/1\.[01] 200\b/.test(statusLine)) {
+      socket.destroy();
+      once(new Error(`proxy CONNECT failed: ${statusLine}`));
+      return;
     }
-    const tlsSock = tls.connect({ socket: sock, servername: url.hostname }, () => once(null, tlsSock));
-    tlsSock.once('error', (e) => once(e));
+    const tlsSocket = tls.connect({ socket, servername: url.hostname }, () => once(null, tlsSocket));
+    tlsSocket.once('error', (e) => once(e));
   };
-  sock.on('data', onData);
-  sock.once('error', (e) => once(e));
+  socket.on('data', onData);
+  socket.once('error', (e) => once(e));
 }
 
-// one streaming chat attempt. resolves {reply, usage} or throws ProviderError
 class ProviderError extends Error {
-  constructor(message, status, retriable) { super(message); this.status = status; this.retriable = retriable; }
+  constructor(message, status, retriable) {
+    super(message);
+    this.name = 'ProviderError';
+    this.status = status;
+    this.retriable = retriable;
+  }
+}
+
+function contentText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (part && typeof part.text === 'string') return part.text;
+    return '';
+  }).join('');
+}
+
+function normalizeToolAccumulator(accumulator) {
+  return Array.from(accumulator.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, call], index) => ({
+      id: call.id || `call_meshdirect_${Date.now()}_${index}`,
+      type: 'function',
+      function: {
+        name: call.function.name || '',
+        arguments: call.function.arguments || '{}',
+      },
+    }))
+    .filter((call) => call.function.name);
 }
 
 function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
   return new Promise((resolve, reject) => {
     const url = new URL(provider.baseUrl.replace(/\/+$/, '') + '/chat/completions');
-    const toolCalls = [];
-    const body = JSON.stringify({
+    const payload = {
       model: modelId,
       messages,
       stream: true,
       max_tokens: config.maxOutputTokens,
       stream_options: { include_usage: true },
-      // Without these the model has no way to act, so it narrates a tool call
-      // as prose instead of making one.
-      ...(opts.tools && opts.tools.length
-        ? { tools: opts.tools, tool_choice: opts.toolChoice || 'auto' }
-        : {}),
-    });
+    };
+    if (Array.isArray(opts.tools) && opts.tools.length) {
+      payload.tools = opts.tools;
+      payload.tool_choice = 'auto';
+      payload.parallel_tool_calls = true;
+    }
+    const body = JSON.stringify(payload);
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
       'Accept': 'text/event-stream',
       'Content-Length': Buffer.byteLength(body),
+      'User-Agent': 'MeshDirect/2.0',
     };
 
     let settled = false;
-    const fail = (err) => { if (!settled) { settled = true; cleanup(); reject(err); } };
-    const done = (val) => { if (!settled) { settled = true; cleanup(); resolve(val); } };
-
+    let request = null;
+    let lineBuffer = '';
     let reply = '';
     let usage = null;
-    let gotDelta = false;
-    let req = null;
-    let res = null;
-    let lineBuf = '';
-
-    const connectTimer = setTimeout(() => {
-      if (req) req.destroy();
-      fail(new ProviderError('connect timed out', 504, true));
-    }, config.connectTimeoutMs);
-
+    let finishReason = null;
+    let gotOutput = false;
+    let reasoningChars = 0;
+    const toolAccumulator = new Map();
     let stallTimer = null;
-    const armStall = () => {
-      if (stallTimer) clearTimeout(stallTimer);
-      stallTimer = setTimeout(() => {
-        if (req) req.destroy();
-        fail(new ProviderError(gotDelta ? 'stream stall mid-response' : 'stream stall before first token', 504, !gotDelta));
-      }, config.stallTimeoutMs);
-    };
+
     const cleanup = () => {
       clearTimeout(connectTimer);
       if (stallTimer) clearTimeout(stallTimer);
-      if (opts.signal && onAbort) opts.signal.removeEventListener('abort', onAbort);
+      if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        reply,
+        usage,
+        finishReason,
+        toolCalls: normalizeToolAccumulator(toolAccumulator),
+        reasoningChars,
+      });
+    };
+    const connectTimer = setTimeout(() => {
+      if (request) request.destroy();
+      fail(new ProviderError('connect timed out', 504, !gotOutput));
+    }, config.connectTimeoutMs);
+    const armStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        if (request) request.destroy();
+        fail(new ProviderError(gotOutput ? 'stream stalled mid-response' : 'stream stalled before first output', 504, !gotOutput));
+      }, config.stallTimeoutMs);
     };
     const onAbort = () => {
-      if (req) req.destroy();
+      if (request) request.destroy();
       fail(new ProviderError('aborted', 499, false));
     };
     if (opts.signal) {
-      if (opts.signal.aborted) return fail(new ProviderError('aborted', 499, false));
-      opts.signal.addEventListener('abort', onAbort);
+      if (opts.signal.aborted) { onAbort(); return; }
+      opts.signal.addEventListener('abort', onAbort, { once: true });
     }
+
+    const handleToolDelta = (part) => {
+      if (!part || typeof part !== 'object') return;
+      const index = Number.isInteger(part.index) ? part.index : 0;
+      const current = toolAccumulator.get(index) || { id: '', function: { name: '', arguments: '' } };
+      if (typeof part.id === 'string' && part.id) current.id = part.id;
+      const fn = part.function || {};
+      if (typeof fn.name === 'string') current.function.name += fn.name;
+      if (typeof fn.arguments === 'string') current.function.arguments += fn.arguments;
+      toolAccumulator.set(index, current);
+      gotOutput = true;
+      if (opts.onToolDelta) opts.onToolDelta(index, current);
+    };
 
     const handleLine = (line) => {
       if (!line.startsWith('data:')) return;
-      const payload = line.slice(5).trim();
-      if (!payload) return;
-      if (payload === '[DONE]') return;
-      let j;
-      try { j = JSON.parse(payload); } catch { return; }
-      if (j.usage) usage = j.usage;
-      const choice = j.choices && j.choices[0];
-      const delta = choice && choice.delta;
-      const text = delta && typeof delta.content === 'string' ? delta.content : '';
+      const raw = line.slice(5).trim();
+      if (!raw || raw === '[DONE]') return;
+      let event;
+      try { event = JSON.parse(raw); } catch { return; }
+      if (event.usage) usage = event.usage;
+      const choice = event.choices && event.choices[0];
+      if (!choice) return;
+      if (choice.finish_reason != null) finishReason = choice.finish_reason;
+      const delta = choice.delta || {};
+      const text = contentText(delta.content);
       if (text) {
-        gotDelta = true;
+        gotOutput = true;
         reply += text;
-        opts.onDelta(text);
+        if (opts.onDelta) opts.onDelta(text);
       }
-      const calls = delta && delta.tool_calls;
-      if (Array.isArray(calls)) {
-        gotDelta = true;
-        for (const part of calls) {
-          const at = typeof part.index === 'number' ? part.index : toolCalls.length;
-          if (!toolCalls[at]) {
-            toolCalls[at] = { id: '', type: 'function', function: { name: '', arguments: '' } };
-          }
-          const slot = toolCalls[at];
-          if (part.id) slot.id = part.id;
-          if (part.function && part.function.name) slot.function.name += part.function.name;
-          if (part.function && typeof part.function.arguments === 'string') {
-            slot.function.arguments += part.function.arguments;
-          }
-        }
+      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+        gotOutput = true;
+        reasoningChars += delta.reasoning_content.length;
+        if (opts.onReasoning) opts.onReasoning(delta.reasoning_content.length);
       }
+      if (Array.isArray(delta.tool_calls)) delta.tool_calls.forEach(handleToolDelta);
+      // Some compatible endpoints return a complete tool call under message even in a stream.
+      const complete = choice.message && choice.message.tool_calls;
+      if (Array.isArray(complete)) complete.forEach(handleToolDelta);
     };
 
-    connectSocket(config, url, (err, socket) => {
-      if (err) return fail(new ProviderError(`connect failed: ${err.message}`, 502, true));
-      // NB: pass createConnection at request level with NO agent option —
-      // https.Agent ignores createConnection; agent:false also ignores it.
-      req = https.request({
+    connectSocket(config, url, (socketError, socket) => {
+      if (socketError) {
+        fail(new ProviderError(`connect failed: ${socketError.message}`, 502, !gotOutput));
+        return;
+      }
+      request = https.request({
         hostname: url.hostname,
-        path: url.pathname,
+        port: Number(url.port || 443),
+        path: url.pathname + url.search,
         method: 'POST',
         headers,
         createConnection: () => socket,
       });
-      req.on('error', (e) => {
-        if (!settled) fail(new ProviderError(`request error: ${e.message}`, 502, !gotDelta));
+      request.on('error', (e) => {
+        fail(new ProviderError(`request error: ${e.message}`, 502, !gotOutput));
       });
-      req.on('response', (r) => {
-        res = r;
+      request.on('response', (response) => {
         clearTimeout(connectTimer);
-        if (r.statusCode !== 200) {
-          let errBody = '';
-          r.on('data', (c) => { if (errBody.length < 2048) errBody += c.toString('utf8'); });
-          r.on('end', () => {
-            const retriable = r.statusCode === 401 || r.statusCode === 403 || r.statusCode === 429 || r.statusCode >= 500;
-            fail(new ProviderError(`provider HTTP ${r.statusCode}: ${errBody.slice(0, 300)}`, r.statusCode, retriable));
+        if (response.statusCode !== 200) {
+          let errorBody = '';
+          response.on('data', (chunk) => { if (errorBody.length < 4096) errorBody += chunk.toString('utf8'); });
+          response.on('end', () => {
+            const status = response.statusCode || 502;
+            const retriable = [401, 403, 408, 409, 425, 429].includes(status) || status >= 500;
+            fail(new ProviderError(`provider HTTP ${status}: ${errorBody.slice(0, 500)}`, status, retriable));
           });
           return;
         }
         armStall();
-        r.on('data', (chunk) => {
+        response.on('data', (chunk) => {
           armStall();
-          lineBuf += chunk.toString('utf8');
-          let idx;
-          while ((idx = lineBuf.indexOf('\n')) >= 0) {
-            const line = lineBuf.slice(0, idx).replace(/\r$/, '');
-            lineBuf = lineBuf.slice(idx + 1);
+          lineBuffer += chunk.toString('utf8');
+          let index;
+          while ((index = lineBuffer.indexOf('\n')) >= 0) {
+            const line = lineBuffer.slice(0, index).replace(/\r$/, '');
+            lineBuffer = lineBuffer.slice(index + 1);
             handleLine(line);
           }
         });
-        r.on('end', () => {
-          if (lineBuf.trim()) handleLine(lineBuf.replace(/\r$/, ''));
-          done({ reply, usage, toolCalls: toolCalls.filter(Boolean) });
+        response.on('end', () => {
+          if (lineBuffer.trim()) handleLine(lineBuffer.replace(/\r$/, ''));
+          done();
         });
-        r.on('error', (e) => fail(new ProviderError(`stream error: ${e.message}`, 502, !gotDelta)));
+        response.on('error', (e) => {
+          fail(new ProviderError(`stream error: ${e.message}`, 502, !gotOutput));
+        });
       });
-      req.end(body);
+      request.end(body);
     });
   });
 }
 
-// full turn with token-plan primary (+ one key refresh on 401) then free-pool fallback
-async function runChat(config, modelId, messages, opts) {
+async function runChat(config, modelId, messages, opts = {}) {
   const attempts = [];
-  let key = await resolvePrimaryKey(config, false);
-  attempts.push({ provider: config.providers.primary, key });
-  attempts.push({ provider: config.providers.primary, key: null, refresh: true }); // on 401 only
-  if (fallbackKey) attempts.push({ provider: config.providers.fallback, key: fallbackKey });
+  let lastError = null;
+  try {
+    const key = await resolvePrimaryKey(config, false);
+    attempts.push({ provider: config.providers.primary, key, kind: 'primary' });
+    attempts.push({ provider: config.providers.primary, key: null, refresh: true, kind: 'primary-refresh' });
+  } catch (e) {
+    lastError = new ProviderError(e.message, 502, true);
+    if (opts.onProviderError) opts.onProviderError(config.providers.primary.name, 502, sanitizeError(e.message));
+  }
+  if (fallbackKey) attempts.push({ provider: config.providers.fallback, key: fallbackKey, kind: 'fallback' });
 
-  let lastErr = null;
-  let sawDelta = false;
+  let sawModelOutput = false;
   for (const attempt of attempts) {
-    if (attempt.refresh && !(lastErr && lastErr.status === 401)) continue; // refresh retry only after 401
+    if (attempt.refresh && !(lastError && lastError.status === 401)) continue;
     if (attempt.refresh) {
       try { attempt.key = await resolvePrimaryKey(config, true); }
-      catch (e) { lastErr = new ProviderError(e.message, 502, true); continue; }
+      catch (e) {
+        lastError = new ProviderError(e.message, 502, true);
+        if (opts.onProviderError) opts.onProviderError(attempt.provider.name, 502, sanitizeError(e.message));
+        continue;
+      }
     }
     if (!attempt.key) continue;
     try {
-      const out = await chatAttempt(config, attempt.provider, attempt.key, modelId, messages, {
+      const output = await chatAttempt(config, attempt.provider, attempt.key, modelId, messages, {
         ...opts,
-        onDelta: (t) => { sawDelta = true; opts.onDelta(t); },
+        onDelta: (text) => {
+          sawModelOutput = true;
+          if (opts.onDelta) opts.onDelta(text);
+        },
+        onToolDelta: (index, call) => {
+          sawModelOutput = true;
+          if (opts.onToolDelta) opts.onToolDelta(index, call);
+        },
+        onReasoning: (count) => {
+          sawModelOutput = true;
+          if (opts.onReasoning) opts.onReasoning(count);
+        },
       });
-      out.provider = attempt.provider.name;
-      return out;
+      output.provider = attempt.provider.name;
+      return output;
     } catch (e) {
-      lastErr = e instanceof ProviderError ? e : new ProviderError(e.message, 502, true);
-      if (opts.onProviderError && lastErr.status !== 499) {
-        opts.onProviderError(attempt.provider.name, lastErr.status, sanitizeError(lastErr.message));
+      lastError = e instanceof ProviderError ? e : new ProviderError(e.message, 502, true);
+      if (opts.onProviderError && lastError.status !== 499) {
+        opts.onProviderError(attempt.provider.name, lastError.status, sanitizeError(lastError.message));
       }
-      const canFailover = !sawDelta && lastErr.retriable && lastErr.status !== 499;
-      if (!canFailover) break;
+      const mayFailover = !sawModelOutput && lastError.retriable && lastError.status !== 499;
+      if (!mayFailover) break;
     }
   }
-  const err = lastErr || new ProviderError('no provider available', 502, false);
-  err.message = sanitizeError(err.message);
-  throw err;
+  const error = lastError || new ProviderError('no provider available', 502, false);
+  error.message = sanitizeError(error.message);
+  throw error;
 }
 
-module.exports = { runChat, loadFallbackKey, ProviderError };
+module.exports = {
+  runChat,
+  loadFallbackKey,
+  ProviderError,
+  normalizeToolAccumulator,
+  contentText,
+};

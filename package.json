@@ -1,11 +1,12 @@
 {
   "name": "meshdirect",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "OpenClaw-free qwen38 chat backend (drop-in replacement)",
+  "description": "Owned autonomous Qwen 3.8 agent harness with native SG1/SG2 tools",
   "main": "server/index.js",
   "scripts": {
-    "start": "node server/index.js"
+    "start": "node server/index.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=20.12"

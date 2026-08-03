@@ -95,7 +95,13 @@ function createApp(config, log) {
     if (!Number.isFinite(limit)) limit = 80;
     limit = Math.min(200, Math.max(1, limit));
     const messages = sessions.readMessages(config, model, 'main', limit).map((m) => ({
-      id: m.id, role: m.role, content: m.content, timestamp: m.timestamp, tools: [],
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      timestamp: m.timestamp,
+      tools: Array.isArray(m.tools) ? m.tools : [],
+      agent: m.agent && typeof m.agent === 'object' ? m.agent : null,
+      failed: !!m.failed,
     }));
     res.json({ model, label: config.lanes[model].label, sessionId: 'main', messages });
   });
@@ -150,25 +156,42 @@ function createApp(config, log) {
     const send = (event, data) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
+    const initial = jobs.publicView(job);
     send('status', {
-      state: job.state === 'running' ? 'running' : 'queued',
-      queuePosition: jobs.queuePosition(job) || undefined,
-      elapsedMs: Date.now() - job.createdAt,
+      state: initial.state,
+      queuePosition: initial.queuePosition || undefined,
+      elapsedMs: initial.elapsedMs,
+      activity: initial.activity,
+      step: initial.step,
+      toolCalls: initial.toolCalls,
     });
+    for (const tool of initial.tools || []) send('tool', { ...tool, phase: tool.phase || (tool.status === 'running' ? 'start' : 'finish') });
+
     let closed = false;
+    let ping = null;
+    let unsub = () => {};
     const close = () => {
       if (closed) return;
       closed = true;
-      clearInterval(ping);
+      if (ping) clearInterval(ping);
       unsub();
       res.end();
     };
-    const unsub = jobs.subscribe(job, (event, data) => {
+    unsub = jobs.subscribe(job, (event, data) => {
       send(event, data);
       if (event === 'done' || event === 'error') close();
     });
-    const ping = setInterval(() => res.write(': ping\n\n'), config.ssePingMs);
+    ping = setInterval(() => res.write(': ping\n\n'), config.ssePingMs);
     req.on('close', close);
+
+    // The turn may have completed before the browser attached to the stream.
+    if (initial.state === 'done') {
+      send('done', { reply: initial.reply, usage: initial.usage, elapsedMs: initial.elapsedMs, tools: initial.tools });
+      close();
+    } else if (initial.state === 'error') {
+      send('error', { error: initial.error, tools: initial.tools });
+      close();
+    }
   });
 
   // NEW: abort a queued/running turn

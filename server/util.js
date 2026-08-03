@@ -30,6 +30,7 @@ function parseCookies(header) {
 
 function redactSecrets(value) {
   return String(value == null ? '' : value)
+    .replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/g, '[PRIVATE KEY REDACTED]')
     .replace(/\bsk-(?:sp|ws|proj|live|test)?-?[A-Za-z0-9._-]{12,}\b/g, 'sk-REDACTED')
     .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, 'gh_REDACTED')
     .replace(/\bam_[A-Za-z0-9_]{20,}\b/g, 'am_REDACTED')

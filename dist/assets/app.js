@@ -219,7 +219,7 @@
             '<input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required /></div>' +
           '<button class="primary-button" id="login-button" type="submit">Sign in</button>' +
           '<p class="form-message" id="login-message" role="alert"></p>' +
-          '<div class="login-note">The model and gateway credentials remain on the server. Your account password is sent only over HTTPS.</div>' +
+          '<div class="login-note">The model and SG credentials remain on the server. Your account password is sent only over HTTPS.</div>' +
         '</form>' +
       '</section>';
     var form = $('#login-form');
@@ -474,7 +474,7 @@
         if (Number.isFinite(info.messageCount)) parts.push(info.messageCount + ' messages');
         if (info.lastActivityAt) parts.push(fmtTimestamp(info.lastActivityAt));
         if (parts.length) sub = parts.join(' · ');
-        if (lane.running) sub = 'running ' + fmtClock(lane.running.elapsedMs) + ' · ' + sub;
+        if (lane.running) sub = (lane.running.activity || 'running') + ' · ' + fmtClock(lane.running.elapsedMs) + ' · ' + sub;
         else if (info.busy) sub = 'busy · ' + sub;
         else if (lane.queued > 0) sub = lane.queued + ' queued · ' + sub;
       }
@@ -509,7 +509,7 @@
       var copy = el('span', 'model-copy');
       copy.appendChild(el('strong', '', model.label));
       var detail = model.detail || '';
-      if (lane.running) detail = 'Running ' + fmtClock(lane.running.elapsedMs);
+      if (lane.running) detail = (lane.running.activity || 'Running') + ' · ' + fmtClock(lane.running.elapsedMs);
       else if (lane.queued > 0) detail = lane.queued + ' in queue';
       else if (busy) detail = 'Busy';
       copy.appendChild(el('span', '', detail));
@@ -610,6 +610,29 @@
 
   /* ---------------- active job rendering ---------------- */
 
+  function renderToolTimeline(container, tools) {
+    if (!Array.isArray(tools) || !tools.length) return;
+    var timeline = el('section', 'tool-timeline');
+    timeline.setAttribute('aria-label', 'Agent tool activity');
+    var heading = el('div', 'tool-timeline-heading');
+    heading.appendChild(el('strong', '', 'Agent actions'));
+    heading.appendChild(el('span', '', tools.length + (tools.length === 1 ? ' tool call' : ' tool calls')));
+    timeline.appendChild(heading);
+    tools.slice(-20).forEach(function (tool) {
+      var status = tool && tool.status ? String(tool.status) : 'running';
+      var row = el('div', 'tool-row ' + status);
+      row.appendChild(el('span', 'tool-state-dot'));
+      var copy = el('span', 'tool-row-copy');
+      copy.appendChild(el('strong', '', tool && (tool.label || tool.name) ? String(tool.label || tool.name) : 'tool'));
+      var detail = tool && tool.summary ? String(tool.summary) : (status === 'running' ? 'running…' : status);
+      if (tool && Number.isFinite(tool.durationMs) && status !== 'running') detail += ' · ' + fmtClock(tool.durationMs);
+      copy.appendChild(el('span', '', detail));
+      row.appendChild(copy);
+      timeline.appendChild(row);
+    });
+    container.appendChild(timeline);
+  }
+
   function renderActiveJob(container) {
     var job = state.job;
     if (!job || job.model !== state.selectedModel) return;
@@ -646,6 +669,8 @@
       container.appendChild(typing);
     }
 
+    renderToolTimeline(container, job.tools);
+
     // turn state card
     if (job.state !== 'done') {
       var card = el('div', 'turn-state ' + (job.state === 'error' ? 'failed' : (job.state === 'queued' || job.state === 'submitting') ? 'queued' : 'running'));
@@ -655,7 +680,13 @@
       if (job.state === 'error') text = 'Turn failed: ' + (job.error || 'Unknown error');
       else if (job.state === 'queued') text = 'Queued' + (job.queuePosition ? ' · position ' + job.queuePosition : '') + ' · ' + fmtClock(Date.now() - job.enqueuedAt);
       else if (job.state === 'submitting') text = 'Sending…';
-      else text = 'Running · ' + fmtClock(Date.now() - job.enqueuedAt) + (job.mode === 'poll' ? ' · polling' : ' · live stream');
+      else {
+        var activity = job.activity || 'running';
+        var counters = [];
+        if (job.step) counters.push('step ' + job.step);
+        if (job.toolCalls) counters.push(job.toolCalls + (job.toolCalls === 1 ? ' tool' : ' tools'));
+        text = activity + ' · ' + fmtClock(Date.now() - job.enqueuedAt) + (counters.length ? ' · ' + counters.join(' · ') : '') + (job.mode === 'poll' ? ' · polling' : ' · live');
+      }
       summary.appendChild(el('span', '', text));
       card.appendChild(summary);
       container.appendChild(card);
@@ -747,7 +778,12 @@
       usage: null,
       elapsedMs: null,
       error: null,
-      mode: 'sse'
+      mode: 'sse',
+      activity: 'submitting',
+      step: 0,
+      toolCalls: 0,
+      currentTool: null,
+      tools: []
     };
     state.job = job;
     renderMessages(true);

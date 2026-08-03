@@ -1,24 +1,41 @@
-// meshdirect entry point
+// MeshDirect entry point.
 'use strict';
 const fs = require('fs');
+const path = require('path');
 const config = require('./config');
-const sessions = require('./sessions');
 const modelclient = require('./modelclient');
 const { createApp } = require('./app');
 
-const log = (msg) => console.log(`[meshdirect ${new Date().toISOString()}] ${msg}`);
+const log = (message) => console.log(`[meshdirect ${new Date().toISOString()}] ${message}`);
 
-fs.mkdirSync(config.sessionsDir, { recursive: true });
-
-log('one-time OpenClaw transcript import check...');
-try { sessions.importOpenClaw(config, log); } catch (e) { log(`import failed (non-fatal): ${e.message}`); }
+for (const dir of [
+  config.sessionsDir,
+  config.tmpDir,
+  path.join(config.workspaceRoot, 'preview'),
+  path.join(config.workspaceRoot, 'stable'),
+  '/opt/meshdirect/logs',
+]) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
 
 modelclient.loadFallbackKey(config, log);
 
 const { app } = createApp(config, log);
 const server = app.listen(config.port, config.host, () => {
-  log(`listening on http://${config.host}:${config.port} (base ${config.basePath}, cookie ${config.cookieName})`);
+  log(`MeshDirect 2.0 listening on http://${config.host}:${config.port} (base ${config.basePath}, cookie ${config.cookieName})`);
 });
 
-process.on('SIGTERM', () => { log('SIGTERM, shutting down'); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref(); });
-process.on('SIGINT', () => process.kill(process.pid, 'SIGTERM'));
+function shutdown(signal) {
+  log(`${signal}, shutting down`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('uncaughtException', (error) => {
+  log(`uncaught exception: ${error && error.stack ? error.stack : error}`);
+  process.exit(1);
+});
+process.on('unhandledRejection', (error) => {
+  log(`unhandled rejection: ${error && error.stack ? error.stack : error}`);
+});
