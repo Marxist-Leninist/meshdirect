@@ -249,10 +249,23 @@ class JobManager {
       // The provider message now owns copies of any base64 strings it needs;
       // release the queue payload before a potentially long model/tool turn.
       job.attachments = [];
+      // Live token streaming: every pass streams its visible text (tool markup
+      // is filtered out in modelclient), so the browser sees interstitial text
+      // between tool rounds and the final answer token-by-token. onFinalDelta
+      // still delivers the authoritative reply; it only emits when nothing was
+      // streamed (edge case) so the browser never renders the answer twice.
+      let streamedAny = false;
       const out = await this.agent.run({
         modelId: cfg.lanes[job.model].modelId,
         messages,
         signal: ac.signal,
+        onDelta: (text) => {
+          streamedAny = true;
+          live.lastActivity = 'writing';
+          live.lastActivityAt = Date.now();
+          job.reply += text;
+          this._emit(job, 'delta', { text });
+        },
         onProviderError: (provider, status, msg) => {
           live.providerErrors += 1;
           live.latestError = msg;
@@ -280,7 +293,7 @@ class JobManager {
           live.lastActivity = 'writing';
           live.lastActivityAt = Date.now();
           job.reply = text;
-          this._emit(job, 'delta', { text });
+          if (!streamedAny) this._emit(job, 'delta', { text });
         },
       });
       clearTimeout(turnCap);

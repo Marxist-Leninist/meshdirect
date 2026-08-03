@@ -129,7 +129,7 @@ class AgentLoop {
     this.gateway = dependencies.gateway || new SGToolGateway(config, log);
   }
 
-  async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta }) {
+  async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta, onDelta }) {
     const transcript = messages.map((message) => ({ ...message }));
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     const tools = [];
@@ -150,6 +150,7 @@ class AgentLoop {
         signal,
         tools: MODEL_TOOLS,
         onProviderError,
+        onDelta, // live filtered text chunks; tool markup never reaches this path
       });
       lastProvider = output.provider || lastProvider;
       addUsage(usage, output.usage);

@@ -89,9 +89,10 @@ function connectSocket(config, url, cb) {
   sock.once('error', (e) => once(e));
 }
 
-// one streaming provider pass. Content is deliberately buffered until the
-// pass ends: a pass may resolve to tool calls, and raw tool markup must never
-// leak into the user-visible token stream.
+// one streaming provider pass. Content streams live via opts.onDelta through
+// ToolCallTextFilter, so tokens reach the browser incrementally while raw
+// <tool_call> markup is held back; the accumulated raw reply is still returned
+// for the agent loop's own tool-call parsing.
 class ProviderError extends Error {
   constructor(message, status, retriable) { super(message); this.status = status; this.retriable = retriable; }
 }
@@ -123,6 +124,64 @@ function materializeToolCalls(toolFragments) {
       type: 'function',
       function: { name: call.name, arguments: call.arguments || '{}' },
     }));
+}
+
+// Incremental filter for live token streaming: emits user-visible text chunks
+// as they arrive while holding back <tool_call> markup (qwen habit of narrating
+// calls as prose). Complete blocks never reach the browser; flush() DROPS any
+// unterminated tail block rather than leaking partial markup. Native tool_calls
+// deltas travel in a separate field and never enter this path.
+const TOOL_TAG_OPEN = '<tool_call>';
+const TOOL_TAG_CLOSE = '</tool_call>';
+
+class ToolCallTextFilter {
+  constructor() {
+    this.pending = '';   // possible partial tag at end of current plain text
+    this.block = null;   // accumulating inside a <tool_call> block
+  }
+  push(text) {
+    let s = this.pending + String(text);
+    this.pending = '';
+    let emit = '';
+    const holdPartial = (tag) => {
+      let hold = 0;
+      for (let k = Math.min(tag.length - 1, s.length); k > 0; k--) {
+        if (tag.startsWith(s.slice(s.length - k))) { hold = k; break; }
+      }
+      this.pending = s.slice(s.length - hold);
+      return s.slice(0, s.length - hold);
+    };
+    while (s.length) {
+      if (this.block === null) {
+        const i = s.indexOf(TOOL_TAG_OPEN);
+        if (i < 0) {
+          emit += holdPartial(TOOL_TAG_OPEN);
+          s = '';
+        } else {
+          emit += s.slice(0, i);
+          s = s.slice(i + TOOL_TAG_OPEN.length);
+          this.block = '';
+        }
+      } else {
+        const j = s.indexOf(TOOL_TAG_CLOSE);
+        if (j < 0) {
+          this.block += holdPartial(TOOL_TAG_CLOSE);
+          s = '';
+        } else {
+          this.block = null; // complete block: dropped entirely
+          s = s.slice(j + TOOL_TAG_CLOSE.length);
+        }
+      }
+    }
+    return emit;
+  }
+  flush() {
+    // Stream ended: release held plain text; DROP any unterminated markup tail.
+    const emit = this.block === null ? this.pending : '';
+    this.pending = '';
+    this.block = null;
+    return emit;
+  }
 }
 
 function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
@@ -157,6 +216,7 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
     let finishReason = null;
     let sawDone = false;
     const toolFragments = new Map();
+    const deltaFilter = typeof opts.onDelta === 'function' ? new ToolCallTextFilter() : null;
     let req = null;
     let activeSocket = null;
     let res = null;
@@ -209,6 +269,10 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
       if (text) {
         gotDelta = true;
         reply += text;
+        if (deltaFilter) {
+          const visible = deltaFilter.push(text);
+          if (visible) opts.onDelta(visible);
+        }
         if (opts.onOutput) opts.onOutput('content');
       }
       const pieces = delta && Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
@@ -269,6 +333,10 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
             fail(error);
             return;
           }
+          if (deltaFilter) {
+            const tail = deltaFilter.flush();
+            if (tail) opts.onDelta(tail);
+          }
           const toolCalls = materializeToolCalls(toolFragments);
           done({ reply, usage, toolCalls, finishReason });
         });
@@ -324,6 +392,7 @@ async function runChat(config, modelId, messages, opts) {
 
 module.exports = {
   ProviderError,
+  ToolCallTextFilter,
   applyToolCallDelta,
   assertStreamCompleted,
   chatAttempt,
