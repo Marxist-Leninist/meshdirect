@@ -777,6 +777,90 @@ button {
   background: #050906;
 }
 
+
+/* ---------- Live tool activity ---------- */
+
+.tool-activity {
+  align-self: flex-start;
+  width: min(100%, 520px);
+  overflow: hidden;
+  border: 1px solid rgba(56, 227, 163, 0.22);
+  border-radius: 14px;
+  background: rgba(8, 15, 11, 0.9);
+}
+
+.tool-activity-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line);
+  color: #90a49a;
+  font-size: 10px;
+}
+
+.tool-activity-heading strong {
+  color: #d8e7df;
+  font-size: 11px;
+}
+
+.tool-activity-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border-top: 1px solid rgba(255, 255, 255, 0.035);
+  color: #a9bbb1;
+  font-size: 11px;
+}
+
+.tool-activity-heading + .tool-activity-row {
+  border-top: 0;
+}
+
+.tool-activity-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #77877e;
+}
+
+.tool-activity-row.running .tool-activity-dot {
+  background: var(--accent);
+  box-shadow: 0 0 9px rgba(56, 227, 163, 0.55);
+  animation: pulse 1.4s infinite ease-in-out;
+}
+
+.tool-activity-row.complete .tool-activity-dot {
+  background: #71847a;
+}
+
+.tool-activity-row.error .tool-activity-dot {
+  background: var(--danger);
+}
+
+.tool-activity-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #d4e0d9;
+}
+
+.tool-activity-status {
+  white-space: nowrap;
+  color: #879a90;
+  font-size: 10px;
+}
+
+.tool-activity-row.running .tool-activity-status {
+  color: #b9f5d9;
+}
+
+.tool-activity-row.error .tool-activity-status {
+  color: #f2b5ba;
+}
+
 /* ---------- Turn state card ---------- */
 
 .turn-state {

@@ -767,27 +767,54 @@
 
   /* ---------------- active job rendering ---------------- */
 
+  function renderToolActivity(container, tools) {
+    if (!Array.isArray(tools) || !tools.length) return;
+    var recent = tools.slice(-10);
+    var running = recent.filter(function (tool) { return tool && tool.status === 'running'; }).length;
+    var panel = el('section', 'tool-activity');
+    panel.setAttribute('aria-label', 'Live tool activity');
+    var heading = el('div', 'tool-activity-heading');
+    heading.appendChild(el('strong', '', 'Tools'));
+    heading.appendChild(el('span', '', running ? running + ' active now' : recent.length + ' used'));
+    panel.appendChild(heading);
+    recent.forEach(function (tool) {
+      var status = tool && tool.status === 'complete' ? 'complete' : (tool && tool.status === 'error' ? 'error' : 'running');
+      var row = el('div', 'tool-activity-row ' + status);
+      row.appendChild(el('span', 'tool-activity-dot'));
+      row.appendChild(el('span', 'tool-activity-name', tool && (tool.label || tool.name) ? String(tool.label || tool.name) : 'Tool'));
+      row.appendChild(el('span', 'tool-activity-status', status === 'complete' ? 'Done' : (status === 'error' ? 'Failed' : 'Using now')));
+      panel.appendChild(row);
+    });
+    container.appendChild(panel);
+  }
+
   function renderActiveJob(container) {
     var job = state.job;
     if (!job || job.model !== state.selectedModel) return;
 
-    // optimistic user bubble
-    var user = el('article', 'message user');
-    var umeta = el('div', 'message-meta');
-    umeta.appendChild(el('span', '', 'You'));
-    user.appendChild(umeta);
-    user.appendChild(el('div', 'message-bubble', job.message));
-    if (Array.isArray(job.attachments) && job.attachments.length) {
-      var gallery = el('div', 'message-images');
-      job.attachments.forEach(function (attachment) {
-        var preview = document.createElement('img');
-        preview.src = attachment.content;
-        preview.alt = attachment.fileName || 'Attached image';
-        gallery.appendChild(preview);
-      });
-      user.appendChild(gallery);
+    // Optimistic user bubble. Do not duplicate the accepted row after restoring a turn.
+    var hist = historyFor(job.model);
+    var userAlreadyInHistory = !!job.userMessageId && hist.messages.some(function (message) {
+      return message && message.id === job.userMessageId;
+    });
+    if (!userAlreadyInHistory) {
+      var user = el('article', 'message user');
+      var umeta = el('div', 'message-meta');
+      umeta.appendChild(el('span', '', 'You'));
+      user.appendChild(umeta);
+      user.appendChild(el('div', 'message-bubble', job.message));
+      if (Array.isArray(job.attachments) && job.attachments.length) {
+        var gallery = el('div', 'message-images');
+        job.attachments.forEach(function (attachment) {
+          var preview = document.createElement('img');
+          preview.src = attachment.content;
+          preview.alt = attachment.fileName || 'Attached image';
+          gallery.appendChild(preview);
+        });
+        user.appendChild(gallery);
+      }
+      container.appendChild(user);
     }
-    container.appendChild(user);
 
     // streaming / finished assistant bubble
     if (job.reply != null || job.streamText) {
@@ -802,14 +829,6 @@
       bubble.textContent = job.reply != null ? job.reply : job.streamText;
       wrap.appendChild(meta);
       wrap.appendChild(bubble);
-      if (Array.isArray(job.tools) && job.tools.length) {
-        var toolList = el('div', 'message-tools');
-        job.tools.slice(-20).forEach(function (tool) {
-          var label = tool && typeof tool === 'object' ? (tool.label || 'tool') : String(tool);
-          toolList.appendChild(el('span', 'tool-chip ' + (tool.status || ''), label));
-        });
-        wrap.appendChild(toolList);
-      }
       container.appendChild(wrap);
     } else if (job.state === 'running' || job.state === 'queued' || job.state === 'submitting') {
       var typing = el('div', 'typing');
@@ -820,6 +839,9 @@
       typing.appendChild(el('span'));
       container.appendChild(typing);
     }
+
+    // Tool use must be visible before Qwen starts writing the final reply.
+    renderToolActivity(container, job.tools);
 
     // turn state card
     if (job.state !== 'done') {
@@ -1790,6 +1812,13 @@
   }
 
   window.addEventListener('resize', function () { updateSidebarToggleIcon(); });
+  window.addEventListener('pagehide', function () {
+    if (state.job) persistPendingTurn(state.job, state.job.stopRequested ? 'stopping' : state.job.state);
+  });
+  window.addEventListener('pageshow', function (event) {
+    // Back/Forward cache can preserve the old DOM while its stream has gone stale.
+    if (event.persisted && state.authenticated && readPendingTurn()) recoverPendingTurn();
+  });
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
