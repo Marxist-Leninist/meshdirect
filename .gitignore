@@ -1,6 +1,8 @@
 node_modules/
 sessions/*.jsonl
+sessions/auth-sessions.json
 sessions/.imported
-*.log
 sessions/.test-cookies
+*.log
 scripts/.*
+server/*.bak-*

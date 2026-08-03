@@ -53,14 +53,16 @@ The production base is `/qwen38/api`; development also mounts `/api`.
 - Client turn IDs and completion tombstones are durable, preventing SG side-effect
   replay after a browser or service restart.
 - Session JSONL files are mode 0600 under a mode-0700 directory.
-- Active queues and login sessions are in memory; the browser recovers active jobs
-  across reloads, and safely closes interrupted jobs after a service restart.
+- Active queues are in memory; the browser recovers them across reloads and safely
+  closes interrupted jobs after a service restart. Login sessions persist only as
+  token digests in a private mode-0600 state file and slide forward while in use.
 
 ## Verification
 
 ```sh
 npm run check
 bash scripts/selftest.sh <dev-password>
+node scripts/vision-smoke.js <image-file> stable
 ```
 
 `npm run check` performs syntax checks and focused tests for native fragmented
