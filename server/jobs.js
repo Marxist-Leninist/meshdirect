@@ -123,13 +123,14 @@ class JobManager {
     const turnCap = setTimeout(() => ac.abort(new Error('turn cap exceeded')), cfg.turnTimeoutMs);
 
     // persist user message immediately (parity: transcript shows the user turn)
-    sessions.appendMessage(cfg, job.model, 'main', { role: 'user', content: job.message });
+    const userRow = sessions.appendMessage(cfg, job.model, 'main', { role: 'user', content: job.message });
 
     try {
       const history = sessions.readMessages(cfg, job.model, 'main', cfg.historyContextMessages);
       const messages = [{ role: 'system', content: cfg.systemPrompt }];
       let chars = cfg.systemPrompt.length;
       for (const m of history) {
+        if (m.failed) continue; // never re-answer turns that errored/aborted
         if (chars + m.content.length > cfg.historyContextMaxChars) break;
         messages.push({ role: m.role, content: m.content });
         chars += m.content.length;
@@ -169,8 +170,10 @@ class JobManager {
       live.lastActivity = 'waiting';
       live.abortedLastRun = aborted;
       live.lastError = { error: clean, at: new Date().toISOString() };
+      // tag the unanswered user turn as failed so it is never re-answered by a later turn
+      sessions.markFailed(cfg, job.model, 'main', userRow.id);
       if (aborted && job.reply) {
-        sessions.appendMessage(cfg, job.model, 'main', { role: 'assistant', content: job.reply + '\n\n[aborted]' });
+        sessions.appendMessage(cfg, job.model, 'main', { role: 'assistant', content: job.reply + '\n\n[aborted]', failed: true });
       }
       this._emit(job, 'error', { error: clean, status: job.status });
     } finally {

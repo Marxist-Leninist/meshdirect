@@ -33,8 +33,29 @@ function appendMessage(config, model, sessionId, msg) {
   };
   if (msg.usage) row.usage = msg.usage;
   if (msg.imported) row.imported = true;
+  if (msg.failed) row.failed = true;
   fs.appendFileSync(file, JSON.stringify(row) + '\n');
   return row;
+}
+
+// tag a stored message as failed (turn errored) — excluded from future model context,
+// but still shown in history. JSONL is append-only, so rewrite in place (files are small
+// and per-model lanes serialize writers).
+function markFailed(config, model, sessionId, id) {
+  if (!id) return;
+  const file = sessionFile(config, model, sessionId);
+  let lines;
+  try { lines = fs.readFileSync(file, 'utf8').split('\n'); } catch { return; }
+  let changed = false;
+  const out = lines.map((line) => {
+    if (!line.trim()) return line;
+    try {
+      const m = JSON.parse(line);
+      if (m && m.id === id && !m.failed) { m.failed = true; changed = true; return JSON.stringify(m); }
+    } catch { /* keep line as-is */ }
+    return line;
+  });
+  if (changed) fs.writeFileSync(file, out.join('\n'), { mode: 0o600 });
 }
 
 function statsFor(config, model, sessionId) {
@@ -107,4 +128,4 @@ function importOpenClaw(config, log) {
   fs.writeFileSync(marker, new Date().toISOString() + '\n', { mode: 0o600 });
 }
 
-module.exports = { readMessages, appendMessage, statsFor, importOpenClaw };
+module.exports = { readMessages, appendMessage, markFailed, statsFor, importOpenClaw };

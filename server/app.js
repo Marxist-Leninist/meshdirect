@@ -214,7 +214,23 @@ function createApp(config, log) {
     fs.createReadStream(target).pipe(res);
   }
   app.get('/', (req, res) => serveStatic(req, res, ''));
-  app.get(`${config.basePath}`, (_req, res) => res.redirect(`${config.basePath}/`));
+  // favicon lives at dist root (not under assets/)
+  const favicon = (req, res) => {
+    const f = safeJoin('favicon.svg');
+    if (!f || !fs.existsSync(f)) return res.status(404).type('text/plain').send('not found\n');
+    res.set('Content-Type', MIME['.svg']);
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    fs.createReadStream(f).pipe(res);
+  };
+  app.get('/favicon.svg', favicon);
+  app.get(`${config.basePath}/favicon.svg`, favicon);
+  // exact '/qwen38' (no trailing slash) -> single 302 to '/qwen38/' (canonical URL).
+  // NB: non-strict routing also matches '/qwen38/' here, so check req.path exactly
+  // and fall through — otherwise the redirect shadows the index route (302 loop).
+  app.get(`${config.basePath}`, (req, res, next) => {
+    if (req.path !== config.basePath) return next();
+    res.redirect(302, `${config.basePath}/`);
+  });
   app.get([`${config.basePath}/`, `${config.basePath}/index.html`], (req, res) => serveStatic(req, res, ''));
   app.get(`${config.basePath}/assets/*`, (req, res) => serveStatic(req, res, `assets/${req.params[0]}`));
   app.get('/assets/*', (req, res) => serveStatic(req, res, `assets/${req.params[0]}`));

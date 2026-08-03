@@ -49,8 +49,11 @@ Static: `/qwen38/` and `/` serve `dist/` (built by the frontend pipeline); asset
 
 ## Env (see /etc/meshdirect-dev.env)
 
-`HOST PORT BASE_PATH ORIGIN_ALLOW COOKIE_SECURE COOKIE_PATH SESSION_TTL_MS
-APP_USERNAME APP_PASSWORD_HASH` (bcrypt `$2b$12$…`) `MODEL_LABEL PLAN_LABEL WORKSPACE_LABEL
+`HOST PORT BASE_PATH ORIGIN_ALLOW SESSION_TTL_MS
+APP_USERNAME APP_PASSWORD_HASH` (bcrypt `$2b$12$…`)
+`COOKIE_SECURE` (`true` prod → cookie `__Secure-qwen_mesh_session`; `false` dev → `qwen_mesh_session`)
+`COOKIE_PATH` — **env-configurable, default `/qwen38`**: prod must be `/qwen38` (cookie contract
+with nginx/base path), dev uses `/` so the `/api` convenience mount works too. See `env.example`. `MODEL_LABEL PLAN_LABEL WORKSPACE_LABEL
 TURN_TIMEOUT_MS(600000) CONNECT_TIMEOUT_MS(10000) STALL_TIMEOUT_MS(60000) SSE_PING_MS(15000)
 HTTPS_PROXY NO_PROXY` (model egress goes via the corporate proxy through an HTTP CONNECT
 tunnel; `/etc/hosts` pins the token-plan host to 127.0.0.1 so direct egress cannot work).
@@ -83,6 +86,9 @@ pre-first-token stall >60 s: free-pool fallback → if that also fails: user-vis
 event/status mapped to 429/409/504/502 (legacy mapping). Failover only happens before the
 first content delta; a mid-stream stall fails the turn instead of duplicating output.
 Connect timeout 10 s; whole-turn cap 600 s; abort via POST aborts the in-flight request.
+Failed/aborted user turns are tagged `{failed:true}` in the JSONL transcript and excluded
+from future model context (history display is unchanged) — a failed instruction is never
+silently re-answered by the next turn.
 
 ## Rollback
 

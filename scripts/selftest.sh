@@ -51,12 +51,25 @@ echo "== poll job after done =="
 curl -s -b "$JAR" "$API/chat/$JOB" | head -c 400; echo
 echo "== history stable (new turn present?) =="
 curl -s -b "$JAR" "$API/history?model=stable&limit=2" | j 'messages.map(m=>m.role+":"+m.content.slice(0,40))'
+echo "== static regression: redirect + favicon =="
+CODE=$(curl -s -o /dev/null -w '%{http_code}' $BASE/qwen38/)
+echo "GET /qwen38/ -> $CODE (must be 200)"; [ "$CODE" = "200" ] || echo "FAIL: /qwen38/ returned $CODE"
+REDIR=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' $BASE/qwen38)
+echo "GET /qwen38 -> $REDIR (must be single 302/308 to /qwen38/)"
+case "$REDIR" in 30[28]*"$BASE/qwen38/") ;; *) echo "FAIL: /qwen38 redirect = $REDIR";; esac
+NREDIR=$(curl -s -L --max-redirs 3 -o /dev/null -w '%{num_redirects} final=%{http_code}' $BASE/qwen38)
+echo "redirect chain: $NREDIR (must be '1 final=200')"; [ "$NREDIR" = "1 final=200" ] || echo "FAIL: redirect chain $NREDIR"
+FAV=$(curl -s -o /dev/null -w '%{http_code}' $BASE/qwen38/favicon.svg)
+echo "GET /qwen38/favicon.svg -> $FAV (must be 200)"; [ "$FAV" = "200" ] || echo "FAIL: favicon $FAV"
 echo "== abort test =="
 CHAT2=$(curl -s -b "$JAR" -X POST $API/chat -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{"message":"Write a very long essay about the history of computing, at least 2000 words.","model":"preview"}')
 JOB2=$(echo "$CHAT2" | j jobId | tr -d '"')
 sleep 2
 curl -s -b "$JAR" -X POST "$API/chat/$JOB2/abort" -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{}'; echo
 curl -s -b "$JAR" "$API/chat/$JOB2" | j 'state'
+FAILED_MARKED=$(grep -c '"failed":true' /opt/meshdirect/sessions/preview-main.jsonl 2>/dev/null || echo 0)
+echo "failed-tagged rows in preview transcript: $FAILED_MARKED (must be >= 1)"
+[ "$FAILED_MARKED" -ge 1 ] || echo "FAIL: aborted turn not tagged failed"
 echo "== logout =="
 curl -s -o /dev/null -w '%{http_code}\n' -b "$JAR" -X POST $API/logout -H "$ORIGIN" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{}'
 curl -s -b "$JAR" $API/session; echo
