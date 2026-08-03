@@ -47,3 +47,50 @@ test('parallel login attempts cannot bypass the eight-attempt reservation', asyn
   assert.equal(statuses.filter((status) => status === 401).length, 8);
   assert.equal(statuses.filter((status) => status === 429).length, 12);
 });
+
+
+test('legacy open tabs without a client turn id remain accepted', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meshdirect-legacy-chat-'));
+  fs.mkdirSync(path.join(directory, 'dist'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const fakeModelclient = {
+    async runChat() {
+      return {
+        reply: 'accepted', usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        toolCalls: [], finishReason: 'stop', provider: 'test',
+      };
+    },
+  };
+  const { app } = createApp(appConfig(directory), () => {}, { modelclient: fakeModelclient });
+  const server = await new Promise((resolve) => {
+    const listener = app.listen(0, '127.0.0.1', () => resolve(listener));
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  const base = `http://127.0.0.1:${address.port}/qwen38/api`;
+
+  const login = await fetch(`${base}/login`, {
+    method: 'POST',
+    headers: { Origin: 'http://127.0.0.1', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'tester', password: 'correct-password' }),
+  });
+  assert.equal(login.status, 200);
+  const session = await login.json();
+  const cookie = (login.headers.get('set-cookie') || '').split(';', 1)[0];
+  assert.ok(cookie);
+  assert.ok(session.csrfToken);
+
+  const response = await fetch(`${base}/chat`, {
+    method: 'POST',
+    headers: {
+      Origin: 'http://127.0.0.1',
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': session.csrfToken,
+      Cookie: cookie,
+    },
+    body: JSON.stringify({ message: 'What happened so far', model: 'preview', sessionId: 'main' }),
+  });
+  assert.equal(response.status, 202);
+  const job = await response.json();
+  assert.match(job.clientTurnId, /^legacy_[A-Za-z0-9_-]{24}$/);
+});

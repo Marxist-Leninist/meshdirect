@@ -9,6 +9,7 @@ const { JobManager } = require('./jobs');
 const state = require('./state');
 const sessions = require('./sessions');
 const { ImageValidationError, normalizeImages } = require('./images');
+const { randomToken } = require('./util');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -43,14 +44,14 @@ function apiHeaders(_req, res, next) {
   next();
 }
 
-function createApp(config, log) {
+function createApp(config, log, dependencies = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', false);
   app.use(securityHeaders(config));
 
   const auth = initAuth(config);
-  const jobs = new JobManager(config, log);
+  const jobs = new JobManager(config, log, dependencies);
   const startedAt = Date.now();
 
   // --- API router (mounted at /qwen38/api and /api) ----------------------------
@@ -127,16 +128,28 @@ function createApp(config, log) {
     fs.createReadStream(image.file).pipe(res);
   });
 
+  const clientTurnIdRe = /^[A-Za-z0-9_-]{12,80}$/;
+
   function validChatBody(body) {
     if (!body || typeof body !== 'object') return false;
-    const { message, model, sessionId } = body;
+    const { message, model, sessionId, clientTurnId } = body;
     if (typeof message !== 'string' || message.length > 12000) return false;
     if (message.indexOf('\0') !== -1) return false;
     if (model !== 'preview' && model !== 'stable') return false;
     if (sessionId !== undefined && sessionId !== null && sessionId !== '' && sessionId !== 'main') return false;
-    if (typeof body.clientTurnId !== 'string' || !/^[A-Za-z0-9_-]{12,80}$/.test(body.clientTurnId)) return false;
+    // Frontends opened before the durability rollout did not send a client turn
+    // id. Keep those already-open tabs working, while still rejecting malformed
+    // non-empty ids from newer clients.
+    if (clientTurnId !== undefined && clientTurnId !== null && clientTurnId !== ''
+      && (typeof clientTurnId !== 'string' || !clientTurnIdRe.test(clientTurnId))) return false;
     if (!message.trim() && (!Array.isArray(body.attachments) || body.attachments.length === 0)) return false;
     return true;
+  }
+
+  function normalizedClientTurnId(body) {
+    return typeof body.clientTurnId === 'string' && body.clientTurnId
+      ? body.clientTurnId
+      : `legacy_${randomToken(18)}`;
   }
 
   api.post('/chat', auth.requireOrigin, auth.requireJson, auth.requireAuth, auth.requireCsrf, chatLimiter,
@@ -150,7 +163,7 @@ function createApp(config, log) {
           model: req.body.model,
           message,
           attachments,
-          clientTurnId: req.body.clientTurnId,
+          clientTurnId: normalizedClientTurnId(req.body),
         });
         res.status(202).json({ ...jobs.publicView(job), attached: false });
       } catch (e) {
@@ -160,7 +173,6 @@ function createApp(config, log) {
     });
 
   const jobIdRe = /^[A-Za-z0-9_-]{32}$/;
-  const clientTurnIdRe = /^[A-Za-z0-9_-]{12,80}$/;
 
   api.get('/chat/by-client/:clientTurnId', auth.requireAuth, pollLimiter, (req, res) => {
     if (!clientTurnIdRe.test(req.params.clientTurnId)) {
