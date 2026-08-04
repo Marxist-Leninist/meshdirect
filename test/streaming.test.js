@@ -8,7 +8,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { ToolCallTextFilter } = require('../server/modelclient');
+const {
+  ToolCallTextFilter,
+  providerModelId,
+  shouldRetryPrimary,
+} = require('../server/modelclient');
 const { AgentLoop } = require('../server/agentloop');
 
 function collect(filter, chunks) {
@@ -20,6 +24,19 @@ function collect(filter, chunks) {
 
 test('filter passes plain text through untouched', () => {
   assert.equal(collect(new ToolCallTextFilter(), ['hello ', 'world', '']), 'hello world');
+});
+
+test('fallback provider can map preview requests to its supported stable model', () => {
+  assert.equal(providerModelId({ modelId: 'qwen3.8-max' }, 'qwen3.8-max-preview'), 'qwen3.8-max');
+  assert.equal(providerModelId({}, 'qwen3.8-max-preview'), 'qwen3.8-max-preview');
+});
+
+test('primary retries only transient no-response failures', () => {
+  assert.equal(shouldRetryPrimary(429), true);
+  assert.equal(shouldRetryPrimary(502), true);
+  assert.equal(shouldRetryPrimary(504), true);
+  assert.equal(shouldRetryPrimary(401), false);
+  assert.equal(shouldRetryPrimary(403), false);
 });
 
 test('filter hides a complete tool_call block at every split point', () => {

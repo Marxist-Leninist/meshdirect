@@ -4,6 +4,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { initAuth } = require('./auth');
+const { initWebAuthn } = require('./webauthn');
 const { makeLimiter, byIp, bySession } = require('./ratelimit');
 const { JobManager } = require('./jobs');
 const state = require('./state');
@@ -32,7 +33,7 @@ function securityHeaders(config) {
     res.set('X-Frame-Options', 'SAMEORIGIN');
     res.set('Referrer-Policy', 'no-referrer');
     res.set('X-DNS-Prefetch-Control', 'off');
-    res.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+    res.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), publickey-credentials-get=(self), publickey-credentials-create=(self)');
     if (config.cookieSecure) res.set('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
     next();
   };
@@ -90,6 +91,75 @@ function createApp(config, log, dependencies = {}) {
 
   api.post('/logout', auth.requireOrigin, auth.requireJson, express.json({ limit: '32kb', strict: true }),
     auth.requireAuth, auth.requireCsrf, (req, res) => auth.logout(req, res));
+
+  // --- passkeys / WebAuthn ---------------------------------------------------
+  // Registration is gated behind an existing session: only someone already
+  // signed in may enrol a new authenticator. Login is open but rate limited on
+  // the same bucket as password login, so passkeys are not a bypass around it.
+  const webauthn = config.webauthnEnabled ? initWebAuthn(config) : null;
+  const jsonBody = [auth.requireOrigin, auth.requireJson, express.json({ limit: '32kb', strict: true })];
+  const waFail = (res, e, status) => res.status(status || 400).json({ error: e.message || 'Passkey error' });
+
+  api.get('/webauthn/support', (req, res) => {
+    res.json({
+      enabled: !!webauthn,
+      rpId: webauthn ? webauthn.rpId : null,
+      registered: webauthn && req.session ? webauthn.list(req.session.username).length : 0,
+      anyRegistered: webauthn ? webauthn.hasAny() : false,
+    });
+  });
+
+  api.post('/webauthn/register/options', ...jsonBody, auth.requireAuth, auth.requireCsrf, (req, res) => {
+    if (!webauthn) return res.status(404).json({ error: 'Passkeys are disabled' });
+    try { res.json(webauthn.registrationOptions(req.session.username)); }
+    catch (e) { waFail(res, e); }
+  });
+
+  api.post('/webauthn/register/verify', ...jsonBody, auth.requireAuth, auth.requireCsrf, (req, res) => {
+    if (!webauthn) return res.status(404).json({ error: 'Passkeys are disabled' });
+    try {
+      const cred = webauthn.verifyRegistration(req.session.username, req.body);
+      log.info(`[passkey] registered ${cred.id.slice(0, 12)}... for ${req.session.username}`);
+      res.json({ ok: true, credential: cred, credentials: webauthn.list(req.session.username) });
+    } catch (e) { waFail(res, e); }
+  });
+
+  api.post('/webauthn/login/options', ...jsonBody, (req, res) => {
+    if (!webauthn) return res.status(404).json({ error: 'Passkeys are disabled' });
+    if (!webauthn.hasAny()) return res.status(404).json({ error: 'No passkey is registered yet' });
+    try { res.json(webauthn.loginOptions()); }
+    catch (e) { waFail(res, e); }
+  });
+
+  api.post('/webauthn/login/verify', ...jsonBody, (req, res) => {
+    if (!webauthn) return res.status(404).json({ error: 'Passkeys are disabled' });
+    const loginKey = byIp(req);
+    if (loginLimiter.count(loginKey) >= 8) return res.status(429).json({ error: 'Too many login attempts' });
+    loginLimiter.record(loginKey);
+    try {
+      const result = webauthn.verifyAssertion(req.body);
+      log.info(`[passkey] login as ${result.username} via ${result.credential.label}`);
+      req.body = { username: result.username };
+      auth.login(req, res);
+    } catch (e) {
+      log.warn(`[passkey] assertion rejected: ${e.message}`);
+      res.status(401).json({ error: 'Passkey was not accepted' });
+    }
+  });
+
+  api.get('/webauthn/credentials', auth.requireAuth, (req, res) => {
+    if (!webauthn) return res.status(404).json({ error: 'Passkeys are disabled' });
+    res.json({ credentials: webauthn.list(req.session.username) });
+  });
+
+  api.post('/webauthn/credentials/remove', ...jsonBody, auth.requireAuth, auth.requireCsrf, (req, res) => {
+    if (!webauthn) return res.status(404).json({ error: 'Passkeys are disabled' });
+    const id = req.body && req.body.id;
+    if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'Missing credential id' });
+    const ok = webauthn.remove(req.session.username, id);
+    if (!ok) return res.status(404).json({ error: 'Unknown passkey' });
+    res.json({ ok: true, credentials: webauthn.list(req.session.username) });
+  });
 
   api.get('/history', auth.requireAuth, historyLimiter, (req, res) => {
     const { model, sessionId } = req.query;

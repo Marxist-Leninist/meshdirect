@@ -34,6 +34,10 @@ function resolvePrimaryKey(config, force) {
 
 function loadFallbackKey(config, log) {
   fallbackKey = null;
+  if (config.providers.fallback.enabled === false) {
+    log('fallback provider disabled by configuration');
+    return;
+  }
   const file = config.providers.fallback.keyFile;
   if (!file) { log('fallback provider disabled: no key file configured'); return; }
   try {
@@ -95,6 +99,14 @@ function connectSocket(config, url, cb) {
 // for the agent loop's own tool-call parsing.
 class ProviderError extends Error {
   constructor(message, status, retriable) { super(message); this.status = status; this.retriable = retriable; }
+}
+
+function providerModelId(provider, requestedModelId) {
+  return provider && provider.modelId ? provider.modelId : requestedModelId;
+}
+
+function shouldRetryPrimary(status) {
+  return status === 429 || status === 502 || status === 504;
 }
 
 function assertStreamCompleted(sawDone, finishReason, gotDelta = false) {
@@ -229,6 +241,18 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
     }, config.connectTimeoutMs);
 
     let stallTimer = null;
+    let firstByteTimer = null;
+    const armFirstByte = () => {
+      if (firstByteTimer) clearTimeout(firstByteTimer);
+      const timeoutMs = Number(config.firstByteTimeoutMs) > 0
+        ? Number(config.firstByteTimeoutMs)
+        : Math.max(Number(config.stallTimeoutMs) || 60000, 60000);
+      firstByteTimer = setTimeout(() => {
+        if (req) req.destroy();
+        if (activeSocket) activeSocket.destroy();
+        fail(new ProviderError('provider timed out before response headers', 504, true));
+      }, timeoutMs);
+    };
     const armStall = () => {
       if (stallTimer) clearTimeout(stallTimer);
       stallTimer = setTimeout(() => {
@@ -238,6 +262,7 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
     };
     const cleanup = () => {
       clearTimeout(connectTimer);
+      if (firstByteTimer) clearTimeout(firstByteTimer);
       if (stallTimer) clearTimeout(stallTimer);
       if (opts.signal && onAbort) opts.signal.removeEventListener('abort', onAbort);
     };
@@ -292,6 +317,9 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
       if (err) return fail(new ProviderError(`connect failed: ${err.message}`, 502, true));
       // NB: pass createConnection at request level with NO agent option —
       // https.Agent ignores createConnection; agent:false also ignores it.
+      // Proxy/TLS is established. Provider prefill for a large context is
+      // not a connection failure and therefore uses its own longer timer.
+      clearTimeout(connectTimer);
       req = https.request({
         hostname: url.hostname,
         path: url.pathname,
@@ -304,7 +332,10 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
       });
       req.on('response', (r) => {
         res = r;
-        clearTimeout(connectTimer);
+        if (firstByteTimer) {
+          clearTimeout(firstByteTimer);
+          firstByteTimer = null;
+        }
         if (r.statusCode !== 200) {
           let errBody = '';
           r.on('data', (c) => { if (errBody.length < 2048) errBody += c.toString('utf8'); });
@@ -342,6 +373,7 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
         });
         r.on('error', (e) => fail(new ProviderError(`stream error: ${e.message}`, 502, !gotDelta)));
       });
+      armFirstByte();
       req.end(body);
     });
   });
@@ -355,6 +387,7 @@ async function runChat(config, modelId, messages, opts) {
     const key = await resolvePrimaryKey(config, false);
     attempts.push({ provider: config.providers.primary, key });
     attempts.push({ provider: config.providers.primary, key: null, refresh: true }); // on 401 only
+    attempts.push({ provider: config.providers.primary, key: null, retry: true }); // transient pre-output retry
   } catch (error) {
     lastErr = new ProviderError(error.message, 502, true);
     if (opts.onProviderError) opts.onProviderError(config.providers.primary.name, 502, sanitizeError(error.message));
@@ -364,13 +397,17 @@ async function runChat(config, modelId, messages, opts) {
   let sawOutput = false;
   for (const attempt of attempts) {
     if (attempt.refresh && !(lastErr && lastErr.status === 401)) continue; // refresh retry only after 401
+    if (attempt.retry && !(lastErr && shouldRetryPrimary(lastErr.status))) continue;
     if (attempt.refresh) {
       try { attempt.key = await resolvePrimaryKey(config, true); }
+      catch (e) { lastErr = new ProviderError(e.message, 502, true); continue; }
+    } else if (attempt.retry) {
+      try { attempt.key = await resolvePrimaryKey(config, false); }
       catch (e) { lastErr = new ProviderError(e.message, 502, true); continue; }
     }
     if (!attempt.key) continue;
     try {
-      const out = await chatAttempt(config, attempt.provider, attempt.key, modelId, messages, {
+      const out = await chatAttempt(config, attempt.provider, attempt.key, providerModelId(attempt.provider, modelId), messages, {
         ...opts,
         onOutput: (kind) => { sawOutput = true; if (opts.onOutput) opts.onOutput(kind); },
       });
@@ -398,5 +435,7 @@ module.exports = {
   chatAttempt,
   loadFallbackKey,
   materializeToolCalls,
+  providerModelId,
   runChat,
+  shouldRetryPrimary,
 };

@@ -57,7 +57,9 @@ const config = {
     },
     fallback: {
       name: 'alibaba_free_ws',
+      enabled: bool(env.FALLBACK_ENABLED, true),
       baseUrl: env.FALLBACK_BASE_URL || 'https://ws-cigeu9sl07kxfsxh.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1',
+      modelId: env.FALLBACK_MODEL_ID || 'qwen3.8-max',
       keyFile: env.FALLBACK_KEY_FILE || '/etc/meshdirect-fallback-key',
     },
   },
@@ -80,8 +82,16 @@ const config = {
 
   // timeouts
   connectTimeoutMs: int(env.CONNECT_TIMEOUT_MS, 10000),
+  firstByteTimeoutMs: int(env.FIRST_BYTE_TIMEOUT_MS, 300000),
   stallTimeoutMs: int(env.STALL_TIMEOUT_MS, 60000),
   turnTimeoutMs: int(env.TURN_TIMEOUT_MS, 0),
+
+  // passkeys / WebAuthn
+  webauthnEnabled: (env.WEBAUTHN_ENABLED || 'true').toLowerCase() !== 'false',
+  webauthnRpId: env.WEBAUTHN_RP_ID || '',
+  webauthnRpName: env.WEBAUTHN_RP_NAME || 'Qwen 3.8 Mesh',
+  webauthnRequireUserVerification: (env.WEBAUTHN_REQUIRE_UV || 'true').toLowerCase() !== 'false',
+  webauthnStorePath: env.WEBAUTHN_STORE_PATH || '',
 
   // storage
   sessionsDir: env.SESSIONS_DIR || '/opt/meshdirect/sessions',
@@ -95,6 +105,16 @@ const config = {
   ssePingMs: int(env.SSE_PING_MS, 15000),
   maxQueuePerLane: 2,
 };
+
+// WebAuthn RP ID must match the page's registrable domain. Derive it from the
+// first allowed origin so a hostname change cannot silently break passkeys.
+if (!config.webauthnRpId) {
+  try {
+    config.webauthnRpId = new URL(config.originAllow[0]).hostname;
+  } catch {
+    config.webauthnRpId = '';
+  }
+}
 
 config.cookieName = config.cookieSecure ? '__Secure-qwen_mesh_session' : 'qwen_mesh_session';
 

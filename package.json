@@ -7,13 +7,18 @@
   "scripts": {
     "start": "node server/index.js",
     "test": "node --test",
-    "check": "for file in server/*.js dist/assets/app.js; do node --check \"$file\" || exit 1; done && node --test"
+    "check": "for file in server/*.js dist/assets/app.js dist/assets/markdown-renderer.js; do node --check \"$file\" || exit 1; done && node --test"
   },
   "engines": {
     "node": ">=20.12"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
-    "express": "^4.21.2"
+    "dompurify": "3.4.13",
+    "express": "^4.21.2",
+    "marked": "18.0.7"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
   }
 }

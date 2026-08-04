@@ -270,6 +270,112 @@
       && (pending.attachmentKey || '') === attachmentKey(attachments);
   }
 
+  /* ---------------- passkeys (WebAuthn) ---------------- */
+
+  // The browser speaks ArrayBuffers, the API speaks base64url. These two keep
+  // that translation in one place.
+  function b64urlToBuf(value) {
+    var s = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    var raw = atob(s);
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out.buffer;
+  }
+
+  function bufToB64url(buf) {
+    var bytes = new Uint8Array(buf);
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function passkeysUsable() {
+    return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.create);
+  }
+
+  // Windows Hello / Touch ID rather than a roaming security key.
+  function platformAuthenticatorAvailable() {
+    if (!passkeysUsable() || !window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) {
+      return Promise.resolve(false);
+    }
+    return window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()
+      .catch(function () { return false; });
+  }
+
+  function passkeyLogin() {
+    return request('/webauthn/login/options', { method: 'POST', body: {} })
+      .then(function (opts) {
+        return navigator.credentials.get({
+          publicKey: {
+            challenge: b64urlToBuf(opts.challenge),
+            rpId: opts.rpId,
+            timeout: opts.timeout,
+            userVerification: opts.userVerification,
+            allowCredentials: (opts.allowCredentials || []).map(function (c) {
+              return { type: 'public-key', id: b64urlToBuf(c.id) };
+            })
+          }
+        });
+      })
+      .then(function (cred) {
+        if (!cred) throw new ApiError('No passkey was selected.', 0);
+        return request('/webauthn/login/verify', {
+          method: 'POST',
+          body: {
+            id: cred.id,
+            clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+            authenticatorData: bufToB64url(cred.response.authenticatorData),
+            signature: bufToB64url(cred.response.signature)
+          }
+        });
+      });
+  }
+
+  function passkeyRegister(label) {
+    return request('/webauthn/register/options', { method: 'POST', body: {} })
+      .then(function (opts) {
+        return navigator.credentials.create({
+          publicKey: {
+            challenge: b64urlToBuf(opts.challenge),
+            rp: opts.rp,
+            user: {
+              id: b64urlToBuf(opts.user.id),
+              name: opts.user.name,
+              displayName: opts.user.displayName
+            },
+            pubKeyCredParams: opts.pubKeyCredParams,
+            timeout: opts.timeout,
+            attestation: opts.attestation,
+            authenticatorSelection: opts.authenticatorSelection,
+            excludeCredentials: (opts.excludeCredentials || []).map(function (c) {
+              return { type: 'public-key', id: b64urlToBuf(c.id) };
+            })
+          }
+        });
+      })
+      .then(function (cred) {
+        if (!cred) throw new ApiError('Passkey creation was cancelled.', 0);
+        var resp = cred.response;
+        // getPublicKey() gives us SPKI directly, so the server never has to
+        // decode CBOR attestation objects.
+        if (!resp.getPublicKey) throw new ApiError('This browser cannot export the passkey public key.', 0);
+        var spki = resp.getPublicKey();
+        if (!spki) throw new ApiError('This browser did not return a passkey public key.', 0);
+        return request('/webauthn/register/verify', {
+          method: 'POST',
+          body: {
+            id: cred.id,
+            clientDataJSON: bufToB64url(resp.clientDataJSON),
+            authenticatorData: bufToB64url(resp.getAuthenticatorData()),
+            publicKeySpki: bufToB64url(spki),
+            alg: resp.getPublicKeyAlgorithm(),
+            label: label || 'Windows Hello'
+          }
+        });
+      });
+  }
+
   /* ---------------- login view ---------------- */
 
   function renderLogin(message) {
@@ -289,6 +395,7 @@
           '<div class="field"><label for="password">Password</label>' +
             '<input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required /></div>' +
           '<button class="primary-button" id="login-button" type="submit">Sign in</button>' +
+          '<button class="icon-button passkey-button" id="passkey-button" type="button" hidden>' + icon('logout', 18) + '<span>Sign in with Windows Hello</span></button>' +
           '<p class="form-message" id="login-message" role="alert"></p>' +
           '<div class="login-note">The model and gateway credentials remain on the server. Your account password is sent only over HTTPS.</div>' +
         '</form>' +
@@ -301,6 +408,31 @@
     if (state.username) username.value = state.username;
     if (message) msg.textContent = message;
     (state.username ? password : username).focus();
+
+    // Offer the passkey path only when this browser can actually do it and the
+    // server has at least one credential enrolled.
+    var passkeyBtn = $('#passkey-button');
+    if (passkeyBtn && passkeysUsable()) {
+      request('/webauthn/support', { method: 'GET' })
+        .then(function (info) {
+          if (!info || !info.enabled || !info.anyRegistered) return;
+          passkeyBtn.hidden = false;
+          passkeyBtn.addEventListener('click', function () {
+            passkeyBtn.disabled = true;
+            msg.textContent = '';
+            passkeyLogin()
+              .then(function (session) {
+                if (!applySession(session)) throw new ApiError('Sign-in failed.', 0);
+                return enterApp();
+              })
+              .catch(function (err) {
+                msg.textContent = (err && err.message) || 'Passkey sign-in failed.';
+                passkeyBtn.disabled = false;
+              });
+          });
+        })
+        .catch(function () { /* passkeys simply stay hidden */ });
+    }
     form.addEventListener('submit', function (event) {
       event.preventDefault();
       var u = username.value.trim();
@@ -342,6 +474,7 @@
             '</div>' +
             '<div class="header-actions">' +
               '<button class="icon-button notification-button" id="notification-button" type="button" aria-pressed="false" aria-label="Enable reply notifications"></button>' +
+              '<button class="icon-button" id="passkey-add-button" type="button" hidden>' + icon('logout', 18) + '<span>Add passkey</span></button>' +
               '<button class="icon-button" id="logout-button" type="button">' + icon('logout', 18) + '<span>Sign out</span></button>' +
             '</div>' +
           '</header>' +
@@ -368,6 +501,20 @@
     $('#sidebar-backdrop').addEventListener('click', function () { closeDrawer(); });
     $('#notification-button').addEventListener('click', toggleNotifications);
     $('#logout-button').addEventListener('click', logout);
+    var addPasskey = $('#passkey-add-button');
+    if (addPasskey && passkeysUsable()) {
+      platformAuthenticatorAvailable().then(function (available) {
+        if (!available) return;
+        addPasskey.hidden = false;
+        addPasskey.addEventListener('click', function () {
+          addPasskey.disabled = true;
+          passkeyRegister('Windows Hello')
+            .then(function () { window.alert('Passkey added. You can now sign in with Windows Hello.'); })
+            .catch(function (err) { window.alert((err && err.message) || 'Could not add passkey.'); })
+            .then(function () { addPasskey.disabled = false; });
+        });
+      });
+    }
     $('#composer-form').addEventListener('submit', function (event) { event.preventDefault(); sendMessage(); });
     $('#attach-button').addEventListener('click', function () { $('#image-input').click(); });
     $('#image-input').addEventListener('change', selectImages);
@@ -696,6 +843,26 @@
     if (force || nearBottom) region.scrollTop = region.scrollHeight;
   }
 
+  function renderAssistantMarkdown(target, content) {
+    if (window.MeshMarkdown && typeof window.MeshMarkdown.renderInto === 'function') {
+      window.MeshMarkdown.renderInto(target, content);
+    } else {
+      target.textContent = content == null ? '' : String(content);
+    }
+  }
+
+  function scheduleStreamingMarkdown(job) {
+    if (job.markdownFrame) return;
+    job.markdownFrame = requestAnimationFrame(function () {
+      job.markdownFrame = null;
+      if (state.job !== job) return;
+      var bubble = $('#stream-bubble');
+      if (!bubble) return;
+      renderAssistantMarkdown(bubble, job.reply != null ? job.reply : job.streamText);
+      scrollToBottom(false);
+    });
+  }
+
   function messageNode(message) {
     var wrap = el('article', 'message ' + (message.role === 'user' ? 'user' : 'assistant'));
     var meta = el('div', 'message-meta');
@@ -703,7 +870,8 @@
     var ts = fmtTimestamp(message.timestamp);
     if (ts) meta.appendChild(el('span', '', ts));
     var bubble = el('div', 'message-bubble');
-    bubble.textContent = message.content || '';
+    if (message.role === 'assistant') renderAssistantMarkdown(bubble, message.content || '');
+    else bubble.textContent = message.content || '';
     wrap.appendChild(meta);
     wrap.appendChild(bubble);
     if (message.role === 'user' && Array.isArray(message.attachments) && message.attachments.length) {
@@ -826,7 +994,7 @@
       }
       var bubble = el('div', 'message-bubble' + (job.reply == null ? ' streaming' : ''));
       bubble.id = 'stream-bubble';
-      bubble.textContent = job.reply != null ? job.reply : job.streamText;
+      renderAssistantMarkdown(bubble, job.reply != null ? job.reply : job.streamText);
       wrap.appendChild(meta);
       wrap.appendChild(bubble);
       container.appendChild(wrap);
@@ -1388,10 +1556,7 @@
       renderMessages(false);
       bubble = $('#stream-bubble');
     }
-    if (bubble) {
-      bubble.textContent = job.streamText;
-      scrollToBottom(false);
-    }
+    if (bubble) scheduleStreamingMarkdown(job);
   }
 
   function handleStreamEnd(job, controller) {
