@@ -6,3 +6,5 @@ sessions/.test-cookies
 *.log
 scripts/.*
 server/*.bak-*
+backups/
+dist/assets/*.bak-*

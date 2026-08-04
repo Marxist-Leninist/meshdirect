@@ -129,7 +129,7 @@ class AgentLoop {
     this.gateway = dependencies.gateway || new SGToolGateway(config, log);
   }
 
-  async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta, onDelta }) {
+  async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta, onDelta, takeSteering }) {
     const transcript = messages.map((message) => ({ ...message }));
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     const tools = [];
@@ -138,6 +138,25 @@ class AgentLoop {
     let lastProvider = '';
 
     const activity = (value) => { if (onActivity) onActivity(value); };
+    const yieldToIo = () => new Promise((resolve) => setImmediate(resolve));
+    const consumeSteering = (meta) => {
+      if (typeof takeSteering !== 'function') return [];
+      const value = takeSteering(meta);
+      if (!Array.isArray(value)) return [];
+      return value.flatMap((item) => {
+        if (typeof item === 'string' && item.trim()) return [{ message: item.trim() }];
+        if (!item || typeof item.message !== 'string' || !item.message.trim()) return [];
+        return [{ ...item, message: item.message.trim() }];
+      });
+    };
+    const appendSteering = (items) => {
+      for (const item of items) {
+        transcript.push({
+          role: 'user',
+          content: `[Latest live instruction from the user for this current turn. Replan and revise the work accordingly.]\n${item.message}`,
+        });
+      }
+    };
 
     const maxRounds = Number(this.config.maxAgentRounds) > 0 ? Number(this.config.maxAgentRounds) : Infinity;
     for (let round = 1; round <= maxRounds; round += 1) {
@@ -145,6 +164,20 @@ class AgentLoop {
         const error = new Error('aborted');
         error.status = 499;
         throw error;
+      }
+      const steering = consumeSteering({ round, resetOutput: true, phase: 'before-model' });
+      if (steering.length) {
+        answerParts.length = 0;
+        appendSteering(steering);
+        activity({
+          phase: 'steer',
+          status: 'applied',
+          label: steering.length === 1
+            ? 'Applying live steering at the next model step'
+            : `Applying ${steering.length} live steering instructions`,
+          round,
+          steeringCount: steering.length,
+        });
       }
       activity({ phase: 'model', status: 'running', label: 'Qwen is deciding the next step', round });
       const output = await this.modelclient.runChat(this.config, modelId, transcript, {
@@ -155,6 +188,11 @@ class AgentLoop {
       });
       lastProvider = output.provider || lastProvider;
       addUsage(usage, output.usage);
+
+      // A steering POST may already be readable by Node when the provider
+      // promise resolves. Yield one event-loop turn so that request is handled
+      // before we commit the model's now-stale answer or tool decision.
+      await yieldToIo();
 
       let calls = parseNativeToolCalls(output.toolCalls);
       const textFallback = parseTextToolCalls(output.reply || '');
@@ -196,6 +234,25 @@ class AgentLoop {
         continue;
       }
 
+      // Steering accepted while the provider was producing this decision must
+      // be applied before committing either a final answer or any tool call.
+      // This is the critical stale-decision suppression boundary.
+      const decisionSteering = consumeSteering({ round, resetOutput: true, phase: 'after-decision' });
+      if (decisionSteering.length) {
+        answerParts.length = 0;
+        appendSteering(decisionSteering);
+        activity({
+          phase: 'steer',
+          status: 'applied',
+          label: decisionSteering.length === 1
+            ? 'Steering arrived during the model decision; replanning'
+            : `${decisionSteering.length} steering instructions arrived; replanning`,
+          round,
+          steeringCount: decisionSteering.length,
+        });
+        continue;
+      }
+
       if (!calls.length) {
         const finalPart = String(textFallback.rawResidual || '');
         const reply = `${answerParts.join('')}${finalPart}`.trim();
@@ -224,7 +281,9 @@ class AgentLoop {
         })),
       });
 
-      for (const call of routed) {
+      let steeredAfterTool = false;
+      for (let callIndex = 0; callIndex < routed.length; callIndex += 1) {
+        const call = routed[callIndex];
         toolCount += 1;
         const label = toolLabel(call);
         const record = { label, status: 'running', time: new Date().toISOString() };
@@ -244,7 +303,41 @@ class AgentLoop {
           activity({ phase: 'tool', status: 'error', label, tool: label, error: message, round, toolCount });
         }
         transcript.push({ role: 'tool', tool_call_id: call.id, content: result });
+
+        // Same race at a tool boundary: let an instruction accepted while the
+        // tool was finishing land before any remaining stale calls execute.
+        await yieldToIo();
+        const toolSteering = consumeSteering({ round, resetOutput: true, phase: 'after-tool' });
+        if (toolSteering.length) {
+          // Keep the tool-call transcript structurally valid without executing
+          // stale remaining calls selected before the steering arrived.
+          for (let skippedIndex = callIndex + 1; skippedIndex < routed.length; skippedIndex += 1) {
+            transcript.push({
+              role: 'tool',
+              tool_call_id: routed[skippedIndex].id,
+              content: safeJson({
+                ok: false,
+                skipped: true,
+                error: 'Skipped because the user steered the active turn.',
+              }, this.config.maxToolResultChars),
+            });
+          }
+          answerParts.length = 0;
+          appendSteering(toolSteering);
+          activity({
+            phase: 'steer',
+            status: 'applied',
+            label: toolSteering.length === 1
+              ? 'Finished the active tool, then applied steering'
+              : `Finished the active tool, then applied ${toolSteering.length} steering instructions`,
+            round,
+            steeringCount: toolSteering.length,
+          });
+          steeredAfterTool = true;
+          break;
+        }
       }
+      if (steeredAfterTool) continue;
     }
     throw new Error(`Agent reached ${maxRounds} model rounds without a final answer`);
   }

@@ -6,8 +6,8 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test",
-    "check": "for file in server/*.js dist/assets/app.js dist/assets/markdown-renderer.js; do node --check \"$file\" || exit 1; done && node --test"
+    "test": "node --test test/*.test.js",
+    "check": "for file in server/*.js dist/assets/app.js dist/assets/markdown-renderer.js; do node --check \"$file\" || exit 1; done && npm test"
   },
   "engines": {
     "node": ">=20.12"

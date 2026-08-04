@@ -1,4 +1,4 @@
-// job lanes: 1 running + up to 2 queued per model; in-memory jobs; SSE fan-out
+// job lanes: one running job plus a configurable server queue per model; SSE fan-out
 'use strict';
 const { randomToken, sanitizeError, classifyStatus } = require('./util');
 const sessions = require('./sessions');
@@ -71,8 +71,9 @@ class JobManager {
       ownerKey, model, sessionId: 'main', message, attachments, clientTurnId, dedupeKey,
       state: JOB_STATES.QUEUED,
       createdAt: Date.now(), startedAt: null, finishedAt: null,
-      reply: '', error: null, usage: null, status: null,
-      abort: null, listeners: new Set(), tools: [], activity: 'Waiting',
+      reply: '', error: null, usage: null, status: null, outputRevision: 0,
+      abort: null, listeners: new Set(), tools: [], activity: 'Waiting', steering: [],
+      acceptingSteering: false,
     };
     this.jobs.set(job.jobId, job);
     if (dedupeKey) this.turnIndex.set(dedupeKey, job.jobId);
@@ -104,6 +105,20 @@ class JobManager {
       message: job.message,
       tools: job.tools.slice(-20),
       activity: job.activity,
+      outputRevision: Number.isSafeInteger(job.outputRevision) ? job.outputRevision : 0,
+      steering: Array.isArray(job.steering) ? {
+        pending: job.steering.filter((item) => item.state === 'pending').length,
+        applied: job.steering.filter((item) => item.state === 'applied').length,
+        notApplied: job.steering.filter((item) => item.state === 'not-applied').length,
+        items: job.steering.slice(-20).map((item) => ({
+          id: item.id,
+          clientSteerId: item.clientSteerId || null,
+          clientSteeringId: item.clientSteerId || null,
+          state: item.state,
+          createdAt: item.createdAt,
+          appliedAt: item.appliedAt || null,
+        })),
+      } : { pending: 0, applied: 0, notApplied: 0, items: [] },
     };
     if (job.state === JOB_STATES.DONE) v.reply = job.reply;
     if (job.state === JOB_STATES.ERROR) v.error = job.error;
@@ -122,6 +137,141 @@ class JobManager {
     if (active) return active;
     const durable = sessions.findTurnByClient(this.config, clientTurnId, ownerKey);
     return durable ? this._durableJob(durable, ownerKey, clientTurnId) : null;
+  }
+
+  _normaliseSteeringId(clientSteerId) {
+    const cleanId = typeof clientSteerId === 'string' ? clientSteerId.trim() : '';
+    if (!cleanId) return `steer_${randomToken(18)}`;
+    if (!/^[A-Za-z0-9_-]{12,80}$/.test(cleanId)) {
+      const error = new Error('Invalid steering request id');
+      error.status = 400;
+      throw error;
+    }
+    return cleanId;
+  }
+
+  _trimSteering(job) {
+    if (!Array.isArray(job.steering) || job.steering.length <= 240) return;
+    const pending = job.steering.filter((item) => item.state === 'pending');
+    const settled = job.steering.filter((item) => item.state !== 'pending').slice(-200);
+    job.steering = [...settled, ...pending].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  steerJob(job, message, clientSteerId = '') {
+    const clean = typeof message === 'string' ? message.trim() : '';
+    if (!clean || clean.length > 12000 || clean.includes('\0')) {
+      const error = new Error('Invalid steering message');
+      error.status = 400;
+      throw error;
+    }
+    const cleanId = this._normaliseSteeringId(clientSteerId);
+    if (!job) {
+      const error = new Error('That turn is no longer tracked');
+      error.status = 404;
+      throw error;
+    }
+    if (!Array.isArray(job.steering)) job.steering = [];
+
+    // Network retries remain idempotent even if the turn completed after the
+    // first request was accepted. This prevents a successful instruction from
+    // being mistaken for a new queued turn merely because the response packet
+    // took the scenic route through the internet.
+    const existing = job.steering.find((item) => item.clientSteerId === cleanId);
+    if (existing) {
+      if (existing.message !== clean) {
+        const error = new Error('That steering request id was already used for different text');
+        error.status = 409;
+        throw error;
+      }
+      return { ...existing, duplicate: true };
+    }
+
+    if (job.state !== JOB_STATES.RUNNING) {
+      const error = new Error('That turn is no longer running. Queue the message as the next turn instead.');
+      error.status = 409;
+      throw error;
+    }
+
+    const entry = {
+      id: randomToken(18),
+      clientSteerId: cleanId,
+      message: clean,
+      state: 'pending',
+      createdAt: Date.now(),
+      appliedAt: null,
+      duplicate: false,
+    };
+    job.steering.push(entry);
+    job.activity = 'Steering accepted; waiting for the next safe boundary';
+    this._emit(job, 'steer', {
+      id: entry.id,
+      clientSteerId: entry.clientSteerId,
+      clientSteeringId: entry.clientSteerId,
+      state: 'accepted',
+      createdAt: entry.createdAt,
+      pending: job.steering.filter((item) => item.state === 'pending').length,
+      applied: job.steering.filter((item) => item.state === 'applied').length,
+      resetOutput: false,
+    });
+    return entry;
+  }
+
+  _takeSteering(job, meta = {}) {
+    if (!Array.isArray(job.steering)) return [];
+    const pending = job.steering.filter((item) => item.state === 'pending');
+    if (!pending.length) return [];
+    const appliedAt = Date.now();
+    for (const item of pending) {
+      item.state = 'applied';
+      item.appliedAt = appliedAt;
+    }
+    const resetOutput = !!meta.resetOutput || !!job.reply;
+    if (resetOutput) job.reply = '';
+    job.activity = resetOutput
+      ? 'Applying steering and revising the reply'
+      : 'Applying steering at the next model step';
+    this._emit(job, 'steer', {
+      ids: pending.map((item) => item.id),
+      count: pending.length,
+      state: 'applied',
+      appliedAt,
+      round: Number.isSafeInteger(meta.round) ? meta.round : undefined,
+      phase: typeof meta.phase === 'string' ? meta.phase : undefined,
+      resetOutput,
+      pending: 0,
+      applied: job.steering.filter((item) => item.state === 'applied').length,
+      notApplied: job.steering.filter((item) => item.state === 'not-applied').length,
+    });
+    this._trimSteering(job);
+    return pending.map((item) => ({
+      id: item.id,
+      clientSteerId: item.clientSteerId,
+      message: item.message,
+      createdAt: item.createdAt,
+    }));
+  }
+
+  _markPendingSteeringNotApplied(job, reason) {
+    if (!Array.isArray(job.steering)) return;
+    const pending = job.steering.filter((item) => item.state === 'pending');
+    if (!pending.length) return;
+    const at = Date.now();
+    for (const item of pending) {
+      item.state = 'not-applied';
+      item.appliedAt = at;
+    }
+    this._emit(job, 'steer', {
+      ids: pending.map((item) => item.id),
+      count: pending.length,
+      state: 'not-applied',
+      appliedAt: at,
+      reason,
+      pending: 0,
+      applied: job.steering.filter((item) => item.state === 'applied').length,
+      notApplied: job.steering.filter((item) => item.state === 'not-applied').length,
+      resetOutput: false,
+    });
+    this._trimSteering(job);
   }
 
   _durableJob(record, ownerKey, clientTurnId) {
@@ -149,6 +299,7 @@ class JobManager {
       attachments: [],
       listeners: new Set(),
       abort: null,
+      steering: [],
       durable: true,
     };
   }
@@ -261,6 +412,11 @@ class JobManager {
         modelId: cfg.lanes[job.model].modelId,
         messages,
         signal: ac.signal,
+        takeSteering: (meta) => {
+          const steering = this._takeSteering(job, meta);
+          if (steering.length) streamedAny = false;
+          return steering;
+        },
         onDelta: (text) => {
           streamedAny = true;
           live.lastActivity = 'writing';
@@ -302,6 +458,7 @@ class JobManager {
       job.reply = out.reply;
       job.tools = out.tools || [];
       job.usage = out.usage || null;
+      this._markPendingSteeringNotApplied(job, 'Turn completed before steering could be applied');
       job.state = JOB_STATES.DONE;
       job.finishedAt = Date.now();
       live.lastActivity = 'waiting';
@@ -324,6 +481,7 @@ class JobManager {
       const clean = sanitizeError(timedOut ? 'Turn timed out' : aborted ? 'Turn aborted' : (e && e.message));
       job.error = clean;
       job.status = timedOut ? 504 : aborted ? 499 : classifyStatus(clean);
+      this._markPendingSteeringNotApplied(job, clean);
       job.state = JOB_STATES.ERROR;
       job.finishedAt = Date.now();
       live.lastActivity = 'waiting';

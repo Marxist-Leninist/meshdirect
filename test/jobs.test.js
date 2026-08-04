@@ -132,3 +132,89 @@ test('zero turn timeout leaves the turn running until completion', async (t) => 
   assert.equal(job.state, 'done');
   assert.equal(job.reply, 'completed without a harness deadline');
 });
+
+
+test('a running job applies idempotent steering and clears stale streamed output', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meshdirect-steer-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let enter;
+  const entered = new Promise((resolve) => { enter = resolve; });
+  let release;
+  const wait = new Promise((resolve) => { release = resolve; });
+  const agent = {
+    async run(input) {
+      enter(input);
+      await wait;
+      const steering = input.takeSteering({ round: 2, resetOutput: true, phase: 'after-decision' });
+      assert.deepEqual(steering.map((item) => item.message), ['Check the relay, not DNS.']);
+      return { reply: 'steered', usage: null, tools: [] };
+    },
+  };
+  const manager = new JobManager(config(directory), () => {}, { agent });
+  const job = manager.enqueue({
+    ownerKey: 'owner', model: 'preview', message: 'repair it', clientTurnId: 'turn_steering_1234',
+  });
+  await entered;
+  job.reply = 'stale streamed draft';
+  const events = [];
+  manager.subscribe(job, (event, data) => { if (event === 'steer') events.push(data); });
+  const clientSteerId = 'steer_jobs_123456';
+  const entry = manager.steerJob(job, '  Check the relay, not DNS.  ', clientSteerId);
+  const duplicate = manager.steerJob(job, 'Check the relay, not DNS.', clientSteerId);
+  assert.equal(entry.state, 'pending');
+  assert.equal(duplicate.id, entry.id);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(job.steering.length, 1);
+  assert.throws(
+    () => manager.steerJob(job, 'Different instruction', clientSteerId),
+    (error) => error.status === 409,
+  );
+  release();
+  await waitForTerminal(manager, job);
+  assert.equal(job.state, 'done');
+  assert.equal(job.reply, 'steered');
+  assert.equal(job.steering[0].state, 'applied');
+  assert.ok(events.some((event) => event.state === 'accepted'));
+  assert.ok(events.some((event) => event.state === 'applied' && event.resetOutput === true));
+  assert.equal(manager.publicView(job).steering.applied, 1);
+
+  // A lost HTTP response can be retried after completion without creating a
+  // second instruction or misclassifying it as a new queued turn.
+  const terminalDuplicate = manager.steerJob(job, 'Check the relay, not DNS.', clientSteerId);
+  assert.equal(terminalDuplicate.id, entry.id);
+  assert.equal(terminalDuplicate.duplicate, true);
+  assert.throws(
+    () => manager.steerJob(job, 'too late', 'steer_jobs_new_1234'),
+    (error) => error.status === 409,
+  );
+});
+
+test('steering has no arbitrary pending-message rejection cap', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meshdirect-steer-many-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let entered;
+  const running = new Promise((resolve) => { entered = resolve; });
+  let release;
+  const wait = new Promise((resolve) => { release = resolve; });
+  const manager = new JobManager(config(directory), () => {}, {
+    agent: {
+      async run(input) {
+        entered();
+        await wait;
+        const steering = input.takeSteering({ round: 2, resetOutput: true });
+        return { reply: `applied ${steering.length}`, usage: null, tools: [] };
+      },
+    },
+  });
+  const job = manager.enqueue({
+    ownerKey: 'owner', model: 'stable', message: 'long task', clientTurnId: 'turn_many_steer_1234',
+  });
+  await running;
+  for (let index = 0; index < 24; index += 1) {
+    manager.steerJob(job, `Instruction ${index + 1}`, `steer_many_${String(index).padStart(4, '0')}`);
+  }
+  assert.equal(manager.publicView(job).steering.pending, 24);
+  release();
+  await waitForTerminal(manager, job);
+  assert.equal(job.reply, 'applied 24');
+});

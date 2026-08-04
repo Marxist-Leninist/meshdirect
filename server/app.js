@@ -216,6 +216,48 @@ function createApp(config, log, dependencies = {}) {
     return true;
   }
 
+  function steeringRequestId(body) {
+    if (!body || typeof body !== 'object') return '';
+    const canonical = typeof body.clientSteerId === 'string' ? body.clientSteerId.trim() : '';
+    const alias = typeof body.clientSteeringId === 'string' ? body.clientSteeringId.trim() : '';
+    if (canonical && alias && canonical !== alias) return null;
+    return canonical || alias || '';
+  }
+
+  function validSteeringBody(body) {
+    if (!body || typeof body !== 'object') return false;
+    if (typeof body.message !== 'string' || !body.message.trim()) return false;
+    if (body.message.length > 12000 || body.message.indexOf('\0') !== -1) return false;
+    const requestId = steeringRequestId(body);
+    return requestId !== null && (!requestId || clientTurnIdRe.test(requestId));
+  }
+
+  function sendSteering(job, req, res) {
+    if (!validSteeringBody(req.body)) return res.status(400).json({ error: 'Invalid steering message' });
+    try {
+      const steering = jobs.steerJob(job, req.body.message, steeringRequestId(req.body));
+      const view = jobs.publicView(job);
+      const instruction = {
+        id: steering.id,
+        clientSteerId: steering.clientSteerId,
+        clientSteeringId: steering.clientSteerId,
+        state: steering.state,
+        createdAt: steering.createdAt,
+        appliedAt: steering.appliedAt || null,
+        duplicate: !!steering.duplicate,
+      };
+      return res.status(steering.duplicate ? 200 : 202).json({
+        ...view,
+        accepted: true,
+        steering: view.steering,
+        instruction,
+        steeringInstruction: instruction,
+      });
+    } catch (error) {
+      return res.status(error.status || 500).json({ error: error.message || 'Could not steer that turn' });
+    }
+  }
+
   function normalizedClientTurnId(body) {
     return typeof body.clientTurnId === 'string' && body.clientTurnId
       ? body.clientTurnId
@@ -252,6 +294,16 @@ function createApp(config, log, dependencies = {}) {
     if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
     res.json(jobs.publicView(job));
   });
+
+  api.post('/chat/by-client/:clientTurnId/steer', auth.requireOrigin, auth.requireJson,
+    express.json({ limit: '32kb', strict: true }), auth.requireAuth, auth.requireCsrf, chatLimiter, (req, res) => {
+      if (!clientTurnIdRe.test(req.params.clientTurnId)) {
+        return res.status(404).json({ error: 'That turn is no longer tracked' });
+      }
+      const job = jobs.getByClient(req.params.clientTurnId, ownerKey(req));
+      if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
+      return sendSteering(job, req, res);
+    });
 
   api.post('/chat/by-client/:clientTurnId/abort', auth.requireOrigin, auth.requireJson,
     express.json({ limit: '32kb', strict: true }), auth.requireAuth, auth.requireCsrf, (req, res) => {
@@ -321,12 +373,22 @@ function createApp(config, log, dependencies = {}) {
       close();
       return;
     }
+    const initialView = jobs.publicView(job);
     send('status', {
       state: job.state,
       queuePosition: jobs.queuePosition(job) || undefined,
       elapsedMs: Date.now() - job.createdAt,
+      steering: initialView.steering,
     });
   });
+
+  api.post('/chat/:jobId/steer', auth.requireOrigin, auth.requireJson, express.json({ limit: '32kb', strict: true }),
+    auth.requireAuth, auth.requireCsrf, chatLimiter, (req, res) => {
+      if (!jobIdRe.test(req.params.jobId)) return res.status(404).json({ error: 'That turn is no longer tracked' });
+      const job = jobs.getOwned(req.params.jobId, ownerKey(req));
+      if (!job) return res.status(404).json({ error: 'That turn is no longer tracked' });
+      return sendSteering(job, req, res);
+    });
 
   // NEW: abort a queued/running turn
   api.post('/chat/:jobId/abort', auth.requireOrigin, auth.requireJson, express.json({ limit: '32kb', strict: true }),

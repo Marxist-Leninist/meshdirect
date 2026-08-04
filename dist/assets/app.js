@@ -7,7 +7,7 @@
   var NOTIFY_KEY = 'meshdirect.notifications';
   var PENDING_TURN_KEY = 'meshdirect.pendingTurn.v1';
   var QUEUED_TURNS_KEY = 'meshdirect.queuedTurns.v1';
-  var MAX_QUEUED_TURNS = 12;
+  var ACTIVE_SEND_MODE_KEY = 'meshdirect.activeSendMode.v1';
   var STATE_POLL_MS = 5000;
   var JOB_POLL_MS = 2500;
   var MAX_MESSAGE = 12000;
@@ -45,6 +45,8 @@
     notificationsEnabled: false,
     attachments: [],
     sending: false,
+    steering: false,
+    activeSendMode: readActiveSendMode(),
     queuedTurns: readQueuedTurns()
   };
 
@@ -485,9 +487,15 @@
           '<section class="chat-region" id="chat-region" aria-label="Conversation" tabindex="-1"><div class="messages" id="messages"></div></section>' +
           '<div class="status-strip" id="status-strip" role="status"><div class="status-strip-inner" id="status-strip-inner"></div></div>' +
           '<footer class="composer-shell">' +
-            '<div class="queue-mode-banner" id="queue-mode-banner" hidden>' +
-              '<span class="queue-mode-dot" aria-hidden="true"></span>' +
-              '<span><strong>Queue next</strong><small>The current turn keeps running. Send now to run this message immediately after it.</small></span>' +
+            '<div class="active-turn-panel" id="active-turn-panel" hidden>' +
+              '<div class="active-turn-copy">' +
+                '<span class="active-turn-dot" aria-hidden="true"></span>' +
+                '<span><strong id="active-turn-title">Queue next</strong><small id="active-turn-help">Runs as a separate turn after the current work finishes.</small></span>' +
+              '</div>' +
+              '<div class="active-mode-switch" id="active-mode-switch" role="group" aria-label="Choose what this message should do">' +
+                '<button class="active-mode-button" type="button" data-active-mode="steer" aria-pressed="false">Steer current</button>' +
+                '<button class="active-mode-button" type="button" data-active-mode="queue" aria-pressed="true">Queue next</button>' +
+              '</div>' +
             '</div>' +
             '<section class="queued-turns-panel" id="queued-turns-panel" aria-label="Queued messages" hidden></section>' +
             '<div class="attachment-preview" id="attachment-preview" aria-live="polite"></div>' +
@@ -527,6 +535,7 @@
     $('#attach-button').addEventListener('click', function () { $('#image-input').click(); });
     $('#image-input').addEventListener('change', selectImages);
     $('#abort-button').addEventListener('click', abortJob);
+    $('#active-mode-switch').addEventListener('click', handleActiveModeAction);
     $('#queued-turns-panel').addEventListener('click', handleQueuedTurnAction);
     var input = $('#composer-input');
     input.addEventListener('input', function () { resizeComposer(input); });
@@ -619,7 +628,13 @@
       });
     })).then(function (items) {
       state.attachments = state.attachments.concat(items);
+      if (currentJobActive() && state.activeSendMode === 'steer') {
+        state.activeSendMode = 'queue';
+        persistActiveSendMode();
+        setComposerStatus('Switched to Queue next because images cannot be injected into a running turn.');
+      }
       renderAttachments();
+      updateSendControls();
       announce(items.length + (items.length === 1 ? ' image attached.' : ' images attached.'));
     }).catch(function (error) {
       showToast(error.message || 'Could not read the selected image.');
@@ -629,6 +644,7 @@
   function removeAttachment(index) {
     state.attachments.splice(index, 1);
     renderAttachments();
+    updateSendControls();
   }
 
   function renderAttachments() {
@@ -1022,6 +1038,16 @@
     // Tool use must be visible before Qwen starts writing the final reply.
     renderToolActivity(container, job.tools);
 
+    var steering = normalizeSteeringSummary(job.steering);
+    if (steering.pending || steering.applied || steering.notApplied) {
+      var steeringPanel = el('div', 'steering-state');
+      steeringPanel.appendChild(el('strong', '', 'Live steering'));
+      if (steering.pending) steeringPanel.appendChild(el('span', 'pending', steering.pending + ' waiting'));
+      if (steering.applied) steeringPanel.appendChild(el('span', 'applied', steering.applied + ' applied'));
+      if (steering.notApplied) steeringPanel.appendChild(el('span', 'not-applied', steering.notApplied + ' not applied'));
+      container.appendChild(steeringPanel);
+    }
+
     // turn state card
     if (job.state !== 'done') {
       var card = el('div', 'turn-state ' + (job.state === 'error' ? 'failed' : (job.state === 'queued' || job.state === 'submitting') ? 'queued' : 'running'));
@@ -1044,13 +1070,206 @@
   }
 
 
+
+  /* ---------------- active-turn queue / steering mode ---------------- */
+
+  function readActiveSendMode() {
+    try { return localStorage.getItem(ACTIVE_SEND_MODE_KEY) === 'steer' ? 'steer' : 'queue'; }
+    catch (error) { return 'queue'; }
+  }
+
+  function persistActiveSendMode() {
+    try { localStorage.setItem(ACTIVE_SEND_MODE_KEY, state.activeSendMode === 'steer' ? 'steer' : 'queue'); }
+    catch (error) { /* storage may be blocked */ }
+  }
+
+  function currentJobActive() {
+    return !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
+  }
+
+  function canSteerCurrentJob() {
+    return currentJobActive() && state.job.state === 'running' && !state.job.stopRequested;
+  }
+
+  function effectiveActiveSendMode() {
+    if (!currentJobActive()) return 'send';
+    return state.activeSendMode === 'steer' && canSteerCurrentJob() ? 'steer' : 'queue';
+  }
+
+  function renderActiveTurnPanel(active, steerable, mode) {
+    var panel = $('#active-turn-panel');
+    if (!panel) return;
+    panel.hidden = !active;
+    if (!active) return;
+    var title = $('#active-turn-title');
+    var help = $('#active-turn-help');
+    var selected = mode === 'steer' ? 'steer' : 'queue';
+    if (title) title.textContent = selected === 'steer' ? 'Steer current turn' : 'Queue next turn';
+    if (help) {
+      if (selected === 'steer') {
+        help.textContent = state.steering
+          ? 'Sending the instruction safely. The current turn keeps its place.'
+          : 'Applies at the next safe model step and revises stale draft text.';
+      } else if (!steerable && state.activeSendMode === 'steer') {
+        help.textContent = 'This turn is not running yet, so messages are queued until steering becomes available.';
+      } else {
+        help.textContent = 'Runs separately after the current turn. Nothing is interrupted.';
+      }
+    }
+    panel.classList.toggle('steer-selected', selected === 'steer');
+    panel.classList.toggle('queue-selected', selected === 'queue');
+    panel.querySelectorAll('[data-active-mode]').forEach(function (button) {
+      var buttonMode = button.dataset.activeMode;
+      var pressed = buttonMode === selected;
+      button.classList.toggle('selected', pressed);
+      button.setAttribute('aria-pressed', String(pressed));
+      button.disabled = buttonMode === 'steer' && !steerable;
+    });
+  }
+
+  function setActiveSendMode(mode, notify) {
+    if (mode !== 'steer' && mode !== 'queue') return;
+    if (mode === 'steer' && state.attachments.length) {
+      setComposerStatus('Images cannot be injected into a running turn. Keep Queue next selected for this message.', true);
+      return;
+    }
+    if (mode === 'steer' && !canSteerCurrentJob()) {
+      setComposerStatus('Steering becomes available when the current turn is running.');
+      return;
+    }
+    state.activeSendMode = mode;
+    persistActiveSendMode();
+    setComposerStatus(mode === 'steer'
+      ? 'The next message will steer the current turn.'
+      : 'The next message will run as a separate queued turn.');
+    updateSendControls();
+    if (notify) announce(mode === 'steer' ? 'Steer current selected.' : 'Queue next selected.');
+    var input = $('#composer-input');
+    if (input) input.focus();
+  }
+
+  function handleActiveModeAction(event) {
+    var button = event.target && event.target.closest ? event.target.closest('[data-active-mode]') : null;
+    if (!button || button.disabled) return;
+    setActiveSendMode(button.dataset.activeMode, true);
+  }
+
+  function emptySteeringSummary() {
+    return { pending: 0, applied: 0, notApplied: 0, items: [] };
+  }
+
+  function normalizeSteeringSummary(value) {
+    if (!value || typeof value !== 'object') return emptySteeringSummary();
+    var items = Array.isArray(value.items) ? value.items.flatMap(function (item) {
+      if (!item || typeof item.id !== 'string') return [];
+      var itemState = item.state === 'applied' || item.state === 'not-applied' ? item.state : 'pending';
+      return [{
+        id: item.id,
+        clientSteeringId: typeof item.clientSteeringId === 'string'
+          ? item.clientSteeringId
+          : (typeof item.clientSteerId === 'string' ? item.clientSteerId : ''),
+        state: itemState,
+        createdAt: Number(item.createdAt) || null,
+        appliedAt: Number(item.appliedAt) || null,
+      }];
+    }) : [];
+    function count(name) { return items.filter(function (item) { return item.state === name; }).length; }
+    return {
+      pending: Number.isSafeInteger(value.pending) ? Math.max(0, value.pending) : count('pending'),
+      applied: Number.isSafeInteger(value.applied) ? Math.max(0, value.applied) : count('applied'),
+      notApplied: Number.isSafeInteger(value.notApplied) ? Math.max(0, value.notApplied) : count('not-applied'),
+      items: items,
+    };
+  }
+
+  function reconcilePendingSteering(job) {
+    var pending = job && job.pendingSteeringRequest;
+    if (!pending) return false;
+    var summary = normalizeSteeringSummary(job.steering);
+    var matched = summary.items.find(function (item) {
+      return item.clientSteeringId && item.clientSteeringId === pending.clientSteeringId;
+    });
+    if (!matched) return false;
+    var input = $('#composer-input');
+    if (input && input.value.trim() === pending.message) {
+      input.value = '';
+      resizeComposer(input);
+    }
+    job.pendingSteeringRequest = null;
+    state.steering = false;
+    if (matched.state === 'applied') {
+      setComposerStatus('Steering applied. Qwen is revising the current turn.');
+    } else if (matched.state === 'not-applied') {
+      setComposerStatus('The turn ended before that steering instruction could be applied.', true);
+    } else {
+      setComposerStatus('Steering accepted. It will apply at the next safe model step.');
+    }
+    return true;
+  }
+
+  function applySteeringEvent(job, data) {
+    var summary = normalizeSteeringSummary(job.steering);
+    var items = summary.items.slice();
+    var ids = Array.isArray(data.ids) ? data.ids.filter(function (id) { return typeof id === 'string'; }) : [];
+    if (typeof data.id === 'string') ids.push(data.id);
+    ids = ids.filter(function (id, index) { return ids.indexOf(id) === index; });
+    if (data.state === 'accepted' && typeof data.id === 'string') {
+      var existing = items.find(function (item) { return item.id === data.id; });
+      if (!existing) {
+        items.push({
+          id: data.id,
+          clientSteeringId: typeof data.clientSteeringId === 'string'
+            ? data.clientSteeringId
+            : (typeof data.clientSteerId === 'string' ? data.clientSteerId : ''),
+          state: 'pending',
+          createdAt: Number(data.createdAt) || Date.now(),
+          appliedAt: null,
+        });
+      }
+    } else if (data.state === 'applied' || data.state === 'not-applied') {
+      ids.forEach(function (id) {
+        var item = items.find(function (candidate) { return candidate.id === id; });
+        if (item) {
+          item.state = data.state;
+          item.appliedAt = Number(data.appliedAt) || Date.now();
+        }
+      });
+    }
+    job.steering = normalizeSteeringSummary({
+      pending: Number.isSafeInteger(data.pending) ? data.pending : undefined,
+      applied: Number.isSafeInteger(data.applied) ? data.applied : undefined,
+      notApplied: Number.isSafeInteger(data.notApplied) ? data.notApplied : undefined,
+      items: items,
+    });
+    if (data.resetOutput) {
+      if (job.markdownFrame) cancelAnimationFrame(job.markdownFrame);
+      job.markdownFrame = null;
+      job.streamText = '';
+      job.reply = null;
+    }
+    if (data.state === 'accepted') {
+      job.activity = 'Steering accepted; waiting for the next model step';
+    } else if (data.state === 'applied') {
+      job.activity = data.resetOutput ? 'Revising the reply from your steering' : 'Applying your steering';
+      setComposerStatus('Steering applied. Qwen is revising the current turn.');
+    } else if (data.state === 'not-applied') {
+      job.activity = 'Steering could not be applied';
+      setComposerStatus(data.reason || 'The turn ended before steering could be applied.', true);
+    }
+    reconcilePendingSteering(job);
+    persistPendingTurn(job, job.stopRequested ? 'stopping' : job.state);
+    updateJobCard();
+    updateSendControls();
+    renderStrip();
+  }
+
   /* ---------------- queued turns ---------------- */
 
   function readQueuedTurns() {
     try {
       var parsed = JSON.parse(localStorage.getItem(QUEUED_TURNS_KEY) || '[]');
       if (!Array.isArray(parsed)) return [];
-      return parsed.slice(-MAX_QUEUED_TURNS).flatMap(function (item) {
+      return parsed.flatMap(function (item) {
         if (!item || typeof item !== 'object') return [];
         if (item.model !== 'preview' && item.model !== 'stable') return [];
         if (typeof item.message !== 'string' || !item.message.trim() || item.message.length > MAX_MESSAGE) return [];
@@ -1140,16 +1359,12 @@
     announce('Queued turn cancelled.');
   }
 
-  function queueCurrentDraft(input) {
+  function queueCurrentDraft(input, noteOverride) {
     var message = input.value.trim();
     var attachments = state.attachments.slice();
     if (!message && !attachments.length) return;
     if (message.length > MAX_MESSAGE) {
       setComposerStatus('Message is too long (max ' + MAX_MESSAGE + ' chars).', true);
-      return;
-    }
-    if (state.queuedTurns.length >= MAX_QUEUED_TURNS) {
-      setComposerStatus('The queue is full. Cancel or let a queued turn run first.', true);
       return;
     }
     state.queuedTurns.push({
@@ -1166,16 +1381,16 @@
     persistQueuedTurns();
     renderQueuedTurns();
     updateSendControls();
-    var note = attachments.length
+    var note = noteOverride || (attachments.length
       ? 'Queued with ' + attachments.length + (attachments.length === 1 ? ' image. Keep this page open until it sends.' : ' images. Keep this page open until they send.')
-      : 'Message queued. It will send automatically after the current turn.';
+      : 'Message queued. It will send automatically after the current turn.');
     setComposerStatus(note);
     announce('Message queued.');
   }
 
   function drainQueuedTurn() {
     var active = !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
-    if (active || state.sending || !state.queuedTurns.length) return;
+    if (active || state.sending || state.steering || !state.queuedTurns.length) return;
     if (state.job && (state.job.state === 'done' || state.job.state === 'error')) state.job = null;
     var item = state.queuedTurns.shift();
     persistQueuedTurns();
@@ -1197,7 +1412,7 @@
     announce('Sending the next queued turn.');
     setTimeout(function () {
       var becameActive = !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
-      if (becameActive || state.sending) {
+      if (becameActive || state.sending || state.steering) {
         state.queuedTurns.unshift(item);
         persistQueuedTurns();
         renderQueuedTurns();
@@ -1268,25 +1483,36 @@
     var abort = $('#abort-button');
     var attach = $('#attach-button');
     var input = $('#composer-input');
-    var banner = $('#queue-mode-banner');
-    var active = !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
-    if (form) form.classList.toggle('queue-active', active);
+    var active = currentJobActive();
+    var steerable = canSteerCurrentJob();
+    var mode = effectiveActiveSendMode();
+    var controlsBusy = state.sending || state.steering;
+    if (form) {
+      form.classList.toggle('queue-active', active && mode === 'queue');
+      form.classList.toggle('steer-active', active && mode === 'steer');
+    }
     if (send) {
+      var label = mode === 'steer' ? 'Steer current turn' : (mode === 'queue' ? 'Queue next message' : 'Send message');
       send.hidden = false;
-      send.disabled = state.sending;
-      send.setAttribute('aria-label', active ? 'Queue next message' : 'Send message');
-      send.title = active ? 'Queue next message' : '';
+      send.disabled = controlsBusy;
+      send.setAttribute('aria-label', label);
+      send.title = active ? label : '';
     }
     if (abort) {
       abort.hidden = !active;
       abort.disabled = !!(state.job && state.job.stopInFlight);
     }
-    if (attach) attach.disabled = state.sending;
-    if (input) {
-      input.disabled = false;
-      input.placeholder = active ? 'Queue another message…' : 'Message Qwen…';
+    if (attach) {
+      attach.disabled = controlsBusy || (active && mode === 'steer');
+      attach.title = active && mode === 'steer' ? 'Switch to Queue next to attach images' : '';
     }
-    if (banner) banner.hidden = !active;
+    if (input) {
+      input.disabled = state.steering;
+      input.placeholder = mode === 'steer'
+        ? 'Steer the current turn…'
+        : (mode === 'queue' ? 'Queue another message…' : 'Message Qwen…');
+    }
+    renderActiveTurnPanel(active, steerable, mode);
     renderQueuedTurns();
   }
 
@@ -1348,6 +1574,7 @@
       error: typeof info.error === 'string' ? info.error : null,
       activity: typeof info.activity === 'string' ? info.activity : 'Recovering turn',
       tools: Array.isArray(info.tools) ? info.tools : [],
+      steering: normalizeSteeringSummary(info.steering),
       mode: 'sse'
     };
   }
@@ -1364,7 +1591,9 @@
     job.queuePosition = Number.isSafeInteger(info.queuePosition) ? info.queuePosition : null;
     job.activity = typeof info.activity === 'string' ? info.activity : job.activity;
     job.tools = Array.isArray(info.tools) ? info.tools : job.tools;
+    job.steering = normalizeSteeringSummary(info.steering || job.steering);
     state.job = job;
+    reconcilePendingSteering(job);
     state.sending = false;
     clearAcceptedDraft(job);
     if (state.selectedModel !== job.model) state.selectedModel = job.model;
@@ -1516,11 +1745,120 @@
       });
   }
 
+
+  function newClientSteeringId() {
+    return 'steer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 14);
+  }
+
+  function requestSteering(job, message, clientSteeringId, attempts) {
+    var path = job.clientTurnId
+      ? '/chat/by-client/' + encodeURIComponent(job.clientTurnId) + '/steer'
+      : '/chat/' + encodeURIComponent(job.jobId) + '/steer';
+    return request(path, {
+      method: 'POST',
+      body: { message: message, clientSteeringId: clientSteeringId }
+    }).catch(function (error) {
+      if (attempts > 1 && (!error || !error.status || error.status >= 500)) {
+        return waitMs(650).then(function () {
+          return requestSteering(job, message, clientSteeringId, attempts - 1);
+        });
+      }
+      throw error;
+    });
+  }
+
+
+  function requireSeparateTurnConfirmation(job, message) {
+    state.activeSendMode = 'queue';
+    persistActiveSendMode();
+    if (job) {
+      job.pendingSteeringRequest = null;
+      job.activity = 'Steering unavailable; waiting for your queue confirmation';
+    }
+    setComposerStatus(message, true);
+    updateJobCard();
+    updateSendControls();
+    var input = $('#composer-input');
+    if (input) input.focus();
+  }
+
+  function sendSteering(input) {
+    if (!input || state.steering) return;
+    var job = state.job;
+    if (!job || job.state !== 'running' || job.stopRequested) {
+      requireSeparateTurnConfirmation(job,
+        'The current turn is no longer steerable. Queue next is selected; press send again to run this message separately.');
+      return;
+    }
+    if (state.attachments.length) {
+      requireSeparateTurnConfirmation(job,
+        'Images cannot be injected into a running turn. Queue next is selected; press send again to run this message separately.');
+      return;
+    }
+    var message = input.value.trim();
+    if (!message) return;
+    if (message.length > MAX_MESSAGE) {
+      setComposerStatus('Message is too long (max ' + MAX_MESSAGE + ' chars).', true);
+      return;
+    }
+    var previous = job.pendingSteeringRequest;
+    var clientSteeringId = previous && previous.message === message
+      ? previous.clientSteeringId
+      : newClientSteeringId();
+    job.pendingSteeringRequest = { clientSteeringId: clientSteeringId, message: message };
+    state.steering = true;
+    job.activity = 'Sending live steering instruction';
+    setComposerStatus('Sending steering without interrupting the current turn…');
+    updateJobCard();
+    updateSendControls();
+
+    requestSteering(job, message, clientSteeringId, 2).then(function (result) {
+      state.steering = false;
+      job.pendingSteeringRequest = null;
+      if (result && result.steering) job.steering = normalizeSteeringSummary(result.steering);
+      if (input.value.trim() === message) {
+        input.value = '';
+        resizeComposer(input);
+      }
+      var instruction = result && result.instruction;
+      var applied = instruction && instruction.state === 'applied';
+      job.activity = applied ? 'Steering applied; revising the reply' : 'Steering accepted; waiting for the next model step';
+      setComposerStatus(applied
+        ? 'Steering was already applied. Qwen is revising the current turn.'
+        : 'Steering accepted. It will apply at the next safe model step.');
+      announce('Steering instruction accepted.');
+      if (state.job === job && job.state !== 'done' && job.state !== 'error') {
+        persistPendingTurn(job, job.stopRequested ? 'stopping' : job.state);
+      }
+      renderMessages(false);
+      updateSendControls();
+      renderStrip();
+      drainQueuedTurn();
+    }).catch(function (error) {
+      state.steering = false;
+      if (!job.pendingSteeringRequest || job.pendingSteeringRequest.clientSteeringId !== clientSteeringId) {
+        setComposerStatus('Steering was confirmed by the live stream.');
+        updateSendControls();
+        return;
+      }
+      if (error && (error.status === 404 || error.status === 409)) {
+        requireSeparateTurnConfirmation(job,
+          'The turn finished before steering was accepted. Your text is untouched; press send again to start it as a separate turn.');
+        return;
+      }
+      job.activity = 'Steering status not confirmed; current turn continues';
+      setComposerStatus(((error && error.message) || 'Could not confirm steering.') + ' Retry keeps the same instruction id.', true);
+      updateJobCard();
+      updateSendControls();
+    });
+  }
+
   function sendMessage() {
     var input = $('#composer-input');
-    if (!input || state.sending) return;
-    if (state.job && state.job.state !== 'done' && state.job.state !== 'error') {
-      queueCurrentDraft(input);
+    if (!input || state.sending || state.steering) return;
+    if (currentJobActive()) {
+      if (effectiveActiveSendMode() === 'steer') sendSteering(input);
+      else queueCurrentDraft(input);
       return;
     }
     var message = input.value.trim();
@@ -1566,6 +1904,7 @@
       error: null,
       activity: 'Sending',
       tools: [],
+      steering: emptySteeringSummary(),
       mode: 'sse'
     };
     job.clientTurnId = reusePending ? pending.clientTurnId : newClientTurnId();
@@ -1704,8 +2043,13 @@
         job.state = 'running';
         job.queuePosition = null;
       }
+      if (data.steering) {
+        job.steering = normalizeSteeringSummary(data.steering);
+        reconcilePendingSteering(job);
+      }
       persistPendingTurn(job, job.stopRequested ? 'stopping' : job.state);
       updateJobCard();
+      updateSendControls();
     } else if (name === 'delta') {
       if (typeof data.text === 'string' && data.text) {
         if (job.state !== 'running') { job.state = 'running'; }
@@ -1724,6 +2068,8 @@
         job.tools = job.tools.slice(-20);
       }
       updateJobCard();
+    } else if (name === 'steer') {
+      applySteeringEvent(job, data);
     } else if (name === 'done') {
       if (Array.isArray(data.tools)) job.tools = data.tools;
       finishJob(job, data.reply != null ? String(data.reply) : job.streamText, data.usage, data.elapsedMs);
@@ -1780,8 +2126,13 @@
             job.queuePosition = Number.isSafeInteger(info.queuePosition) ? info.queuePosition : job.queuePosition;
             if (typeof info.activity === 'string') job.activity = info.activity;
             if (Array.isArray(info.tools)) job.tools = info.tools;
+            if (info.steering) {
+              job.steering = normalizeSteeringSummary(info.steering);
+              reconcilePendingSteering(job);
+            }
             persistPendingTurn(job, job.stopRequested ? 'stopping' : job.state);
             updateJobCard();
+            updateSendControls();
             state.pollTimer = setTimeout(tick, JOB_POLL_MS);
           }
         })
@@ -1988,6 +2339,15 @@
       var q2 = el('span', 'strip-item strip-queue');
       q2.textContent = lane.queued + ' queued';
       strip.appendChild(q2);
+    }
+
+    if (jobActive) {
+      var steeringStatus = normalizeSteeringSummary(job.steering);
+      if (steeringStatus.pending) {
+        var steerItem = el('span', 'strip-item strip-steering');
+        steerItem.textContent = steeringStatus.pending + (steeringStatus.pending === 1 ? ' steering instruction waiting' : ' steering instructions waiting');
+        strip.appendChild(steerItem);
+      }
     }
 
     // elapsed

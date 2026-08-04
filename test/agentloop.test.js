@@ -272,3 +272,231 @@ test('zero round and tool-call limits keep running until the agent completes', a
   assert.equal(result.rounds, 13);
   assert.equal(toolCalls, 12);
 });
+
+
+test('live steering suppresses a stale model decision and is injected in order', async () => {
+  const pending = [];
+  const applied = [];
+  let calls = 0;
+  let executions = 0;
+  const loop = new AgentLoop(config(), () => {}, {
+    modelclient: {
+      async runChat(_config, _model, messages) {
+        calls += 1;
+        if (calls === 1) {
+          assert.equal(messages.some((message) => String(message.content).includes('Latest live instruction')), false);
+          pending.push({ id: 's1', message: 'Check DNS first.' }, { id: 's2', message: 'Do not restart anything.' });
+          return {
+            reply: '',
+            toolCalls: [{
+              id: 'tool-1',
+              type: 'function',
+              function: { name: 'sg1', arguments: '{"action":"search","query":"dns"}' },
+            }],
+            usage: {},
+            provider: 'test',
+          };
+        }
+        const steering = messages.filter((message) => (
+          message.role === 'user' && String(message.content).includes('[Latest live instruction')
+        ));
+        assert.deepEqual(steering.map((message) => message.content.split('\n').at(-1)), [
+          'Check DNS first.',
+          'Do not restart anything.',
+        ]);
+        return { reply: 'Steered safely.', toolCalls: [], usage: {}, provider: 'test' };
+      },
+    },
+    gateway: {
+      async execute() {
+        executions += 1;
+        return { result: 'must not run' };
+      },
+    },
+  });
+  const result = await loop.run({
+    modelId: 'qwen-test',
+    messages: [{ role: 'user', content: 'Repair the host.' }],
+    takeSteering(meta) {
+      const items = pending.splice(0);
+      if (items.length) applied.push(meta);
+      return items;
+    },
+  });
+  assert.equal(result.reply, 'Steered safely.');
+  assert.equal(calls, 2);
+  assert.equal(executions, 0, 'the stale tool decision must not execute');
+  assert.equal(applied[0].phase, 'after-decision');
+  assert.equal(applied[0].resetOutput, true);
+});
+
+test('steering received during a would-be final draft causes a clean revision', async () => {
+  const pending = [];
+  let calls = 0;
+  const applied = [];
+  const emitted = [];
+  const loop = new AgentLoop(config(), () => {}, {
+    modelclient: {
+      async runChat(_config, _model, messages) {
+        calls += 1;
+        if (calls === 1) {
+          pending.push({ id: 'late', message: 'Use the SSH relay instead.' });
+          return { reply: 'I will restart DNS.', toolCalls: [], usage: {}, provider: 'test' };
+        }
+        assert.equal(messages.some((message) => message.role === 'assistant' && message.content === 'I will restart DNS.'), false);
+        assert.match(messages.at(-1).content, /Use the SSH relay instead/);
+        return { reply: 'I used the SSH relay and left DNS untouched.', toolCalls: [], usage: {}, provider: 'test' };
+      },
+    },
+    gateway: { execute: async () => { throw new Error('no tool expected'); } },
+  });
+  const result = await loop.run({
+    modelId: 'qwen-test',
+    messages: [{ role: 'user', content: 'Repair access.' }],
+    takeSteering(meta) {
+      const items = pending.splice(0);
+      if (items.length) applied.push(meta);
+      return items;
+    },
+    onFinalDelta: (text) => emitted.push(text),
+  });
+  assert.equal(result.reply, 'I used the SSH relay and left DNS untouched.');
+  assert.deepEqual(emitted, ['I used the SSH relay and left DNS untouched.']);
+  assert.equal(applied.at(-1).phase, 'after-decision');
+  assert.equal(applied.at(-1).resetOutput, true);
+  assert.equal(calls, 2);
+});
+
+test('steering after an active tool skips stale remaining tool calls', async () => {
+  const pending = [];
+  const executed = [];
+  let modelCalls = 0;
+  const loop = new AgentLoop(config(), () => {}, {
+    modelclient: {
+      async runChat(_config, _model, messages) {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            reply: 'I will inspect both routes.',
+            toolCalls: [
+              { id: 'call-one', type: 'function', function: { name: 'sg1', arguments: '{"action":"search","query":"first"}' } },
+              { id: 'call-two', type: 'function', function: { name: 'sg2', arguments: '{"action":"search","query":"second"}' } },
+            ],
+            usage: {}, provider: 'test',
+          };
+        }
+        const skipped = messages.find((message) => (
+          message.role === 'tool' && message.tool_call_id === 'call-two'
+        ));
+        assert.ok(skipped);
+        assert.match(skipped.content, /Skipped because the user steered/);
+        assert.match(messages.at(-1).content, /Do not probe the second route/);
+        return { reply: 'Stopped after the first route and followed the new instruction.', toolCalls: [], usage: {}, provider: 'test' };
+      },
+    },
+    gateway: {
+      async execute(name) {
+        executed.push(name);
+        pending.push({ id: 'during-tool', message: 'Do not probe the second route.' });
+        return { result: 'first route checked' };
+      },
+    },
+  });
+  const result = await loop.run({
+    modelId: 'qwen-test',
+    messages: [{ role: 'user', content: 'Inspect the routes.' }],
+    takeSteering() { return pending.splice(0); },
+  });
+  assert.deepEqual(executed, ['sg1']);
+  assert.equal(modelCalls, 2);
+  assert.match(result.reply, /followed the new instruction/);
+});
+
+test('steering already waiting in the I/O queue wins the provider completion race', async () => {
+  const pending = [];
+  let modelCalls = 0;
+  let executions = 0;
+  const loop = new AgentLoop(config(), () => {}, {
+    modelclient: {
+      async runChat(_config, _model, messages) {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          setImmediate(() => pending.push({ id: 'io-provider', message: 'Do not execute that tool.' }));
+          return {
+            reply: '',
+            toolCalls: [{
+              id: 'stale-tool',
+              type: 'function',
+              function: { name: 'sg1', arguments: '{"action":"search","query":"stale"}' },
+            }],
+            usage: {},
+            provider: 'test',
+          };
+        }
+        assert.match(messages.at(-1).content, /Do not execute that tool/);
+        return { reply: 'Replanned before tool execution.', toolCalls: [], usage: {}, provider: 'test' };
+      },
+    },
+    gateway: {
+      async execute() {
+        executions += 1;
+        return { result: 'must not execute' };
+      },
+    },
+  });
+
+  const result = await loop.run({
+    modelId: 'qwen-test',
+    messages: [{ role: 'user', content: 'Run the task.' }],
+    takeSteering() { return pending.splice(0); },
+  });
+
+  assert.equal(result.reply, 'Replanned before tool execution.');
+  assert.equal(modelCalls, 2);
+  assert.equal(executions, 0);
+});
+
+test('steering already waiting in the I/O queue wins the tool completion race', async () => {
+  const pending = [];
+  const executions = [];
+  let modelCalls = 0;
+  const loop = new AgentLoop(config(), () => {}, {
+    modelclient: {
+      async runChat(_config, _model, messages) {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            reply: '',
+            toolCalls: [
+              { id: 'first-tool', type: 'function', function: { name: 'sg1', arguments: '{"action":"search","query":"first"}' } },
+              { id: 'stale-second-tool', type: 'function', function: { name: 'sg2', arguments: '{"action":"search","query":"second"}' } },
+            ],
+            usage: {},
+            provider: 'test',
+          };
+        }
+        assert.match(messages.at(-1).content, /Skip the second tool/);
+        const skipped = messages.find((message) => message.role === 'tool' && message.tool_call_id === 'stale-second-tool');
+        assert.match(skipped.content, /Skipped because the user steered/);
+        return { reply: 'Stopped after the active tool.', toolCalls: [], usage: {}, provider: 'test' };
+      },
+    },
+    gateway: {
+      async execute(name) {
+        executions.push(name);
+        setImmediate(() => pending.push({ id: 'io-tool', message: 'Skip the second tool.' }));
+        return { result: 'first complete' };
+      },
+    },
+  });
+
+  const result = await loop.run({
+    modelId: 'qwen-test',
+    messages: [{ role: 'user', content: 'Run both checks.' }],
+    takeSteering() { return pending.splice(0); },
+  });
+
+  assert.equal(result.reply, 'Stopped after the active tool.');
+  assert.deepEqual(executions, ['sg1']);
+  assert.equal(modelCalls, 2);
+});

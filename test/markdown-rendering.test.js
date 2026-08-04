@@ -179,6 +179,19 @@ test('wires every assistant path to the shared renderer and cache-busts assets i
   assert.match(css, /\.markdown-table-scroll[\s\S]*overflow-x: auto/);
   assert.match(css, /\.message\.assistant \.message-bubble[\s\S]*white-space: normal/);
   assert.match(css, /\.message\.user \.message-bubble/);
+  assert.match(app, /data-active-mode=\"steer\"/);
+  assert.match(app, /data-active-mode=\"queue\"/);
+  assert.match(app, /function sendSteering\(input\)/);
+  assert.match(app, /clientSteeringId/);
+  assert.match(app, /function applySteeringEvent\(job, data\)/);
+  assert.match(app, /function requireSeparateTurnConfirmation\(job, message\)/);
+  assert.doesNotMatch(app, /turn finished before steering was accepted, so this message was queued next/);
+  assert.match(app, /Your text is untouched; press send again/);
+  assert.doesNotMatch(app, /MAX_QUEUED_TURNS/);
+  assert.doesNotMatch(app, /The queue is full/);
+  assert.match(app, /job\.streamText = ''/);
+  assert.match(css, /\.active-turn-panel/);
+  assert.match(css, /\.composer\.steer-active \.send-button/);
 });
 
 test('ships parseable CSS and preserves GFM centre and right table alignment', () => {

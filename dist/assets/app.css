@@ -1524,51 +1524,69 @@ button {
 }
 
 
-/* ---------- Queued turns ---------- */
+/* ---------- Active-turn steering and queued turns ---------- */
 
-.queue-mode-banner,
+.active-turn-panel,
 .queued-turns-panel {
   width: min(100%, 900px);
   margin: 0 auto 8px;
 }
 
-.queue-mode-banner {
-  min-height: 42px;
-  padding: 8px 11px;
+.active-turn-panel {
+  min-height: 48px;
+  padding: 7px 8px 7px 11px;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 9px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
   align-items: center;
   border: 1px solid rgba(56, 227, 163, 0.24);
-  border-radius: 13px;
+  border-radius: 14px;
   background: rgba(20, 62, 46, 0.32);
   color: #dff8eb;
 }
 
-.queue-mode-banner[hidden],
+.active-turn-panel.steer-selected {
+  border-color: rgba(210, 170, 85, 0.36);
+  background: rgba(74, 55, 22, 0.28);
+}
+
+.active-turn-panel[hidden],
 .queued-turns-panel[hidden] {
   display: none;
 }
 
-.queue-mode-banner > span:last-child,
-.queue-mode-banner strong,
-.queue-mode-banner small {
+.active-turn-copy {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  align-items: center;
+}
+
+.active-turn-copy > span:last-child,
+.active-turn-copy strong,
+.active-turn-copy small {
   display: block;
   min-width: 0;
 }
 
-.queue-mode-banner strong {
+.active-turn-copy strong {
+  color: #e3f7ec;
   font-size: 11px;
 }
 
-.queue-mode-banner small {
+.active-turn-copy small {
   margin-top: 2px;
   color: #92b5a4;
   font-size: 10px;
   line-height: 1.35;
 }
 
-.queue-mode-dot {
+.active-turn-panel.steer-selected .active-turn-copy small {
+  color: #c1ad7a;
+}
+
+.active-turn-dot {
   width: 9px;
   height: 9px;
   border-radius: 999px;
@@ -1576,7 +1594,57 @@ button {
   box-shadow: 0 0 12px rgba(56, 227, 163, 0.6);
 }
 
-.composer.queue-active {
+.active-turn-panel.steer-selected .active-turn-dot {
+  background: var(--warn);
+  box-shadow: 0 0 12px rgba(210, 170, 85, 0.55);
+}
+
+.active-mode-switch {
+  padding: 3px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(92px, 1fr));
+  gap: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 11px;
+  background: rgba(4, 9, 6, 0.55);
+}
+
+.active-mode-button {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #8fa39a;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.active-mode-button:hover:not(:disabled) {
+  color: #e8f2ed;
+}
+
+.active-mode-button.selected {
+  border-color: rgba(56, 227, 163, 0.28);
+  background: rgba(40, 129, 96, 0.28);
+  color: #dff8eb;
+}
+
+.steer-selected .active-mode-button.selected {
+  border-color: rgba(210, 170, 85, 0.34);
+  background: rgba(139, 99, 29, 0.28);
+  color: #f1ddb0;
+}
+
+.active-mode-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.composer.queue-active,
+.composer.steer-active {
   grid-template-columns: auto minmax(0, 1fr) auto auto;
 }
 
@@ -1587,19 +1655,86 @@ button {
   box-shadow: 0 0 18px rgba(56, 227, 163, 0.18);
 }
 
+.composer.steer-active .send-button {
+  border-color: rgba(210, 170, 85, 0.56);
+  background: linear-gradient(180deg, rgba(225, 187, 103, 0.98), rgba(190, 142, 53, 0.96));
+  color: #161004;
+  box-shadow: 0 0 18px rgba(210, 170, 85, 0.18);
+}
+
+.attach-button:disabled,
+.send-button:disabled,
+.abort-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.steering-state {
+  width: min(88%, 720px);
+  min-width: 0;
+  padding: 8px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  border: 1px solid rgba(210, 170, 85, 0.22);
+  border-radius: 12px;
+  background: rgba(65, 47, 17, 0.24);
+  color: #a99a75;
+  font-size: 9px;
+}
+
+.steering-state strong {
+  margin-right: 2px;
+  color: #dfca99;
+  font-size: 10px;
+}
+
+.steering-state span {
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.steering-state .pending {
+  color: #efd18e;
+}
+
+.steering-state .applied {
+  color: #8fe5c1;
+}
+
+.steering-state .not-applied {
+  color: #f0a6a6;
+}
+
+.strip-steering {
+  color: #e0c27b;
+}
+
 .queued-turns-panel {
+  max-height: 180px;
   padding: 8px;
+  overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: rgba(10, 17, 13, 0.92);
+  scrollbar-width: thin;
 }
 
 .queued-turns-heading {
-  padding: 1px 3px 7px;
+  position: sticky;
+  top: -8px;
+  z-index: 1;
+  margin: -8px -8px 0;
+  padding: 9px 11px 7px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  background: rgba(10, 17, 13, 0.97);
   color: #d8e7df;
   font-size: 10px;
 }
@@ -1616,6 +1751,10 @@ button {
   gap: 8px;
   align-items: center;
   border-top: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.queued-turn-row:first-of-type {
+  border-top: 0;
 }
 
 .queued-turn-index {
@@ -1671,21 +1810,56 @@ button {
   color: #ffd1d1;
 }
 
-@media (max-width: 560px) {
-  .composer.queue-active {
+@media (max-width: 660px) {
+  .active-turn-panel {
+    grid-template-columns: 1fr;
+    gap: 7px;
+    padding: 8px;
+  }
+
+  .active-mode-switch {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .active-mode-button {
+    min-width: 0;
+  }
+
+  .composer.queue-active,
+  .composer.steer-active {
     grid-template-columns: 44px minmax(0, 1fr) 44px 44px;
     gap: 7px;
   }
 
   .composer.queue-active .attach-button,
   .composer.queue-active .send-button,
-  .composer.queue-active .abort-button {
+  .composer.queue-active .abort-button,
+  .composer.steer-active .attach-button,
+  .composer.steer-active .send-button,
+  .composer.steer-active .abort-button {
     width: 44px;
     height: 48px;
     border-radius: 13px;
   }
 
-  .queue-mode-banner {
-    padding: 7px 9px;
+  .queued-turns-panel {
+    max-height: 146px;
+  }
+
+  .steering-state {
+    width: 100%;
+  }
+}
+
+@media (max-width: 430px) {
+  .active-turn-copy small {
+    font-size: 9px;
+  }
+
+  .active-mode-button {
+    min-height: 36px;
+    padding: 0 6px;
+    font-size: 9px;
   }
 }
