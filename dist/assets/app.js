@@ -6,6 +6,8 @@
   var API = BASE + '/api';
   var NOTIFY_KEY = 'meshdirect.notifications';
   var PENDING_TURN_KEY = 'meshdirect.pendingTurn.v1';
+  var QUEUED_TURNS_KEY = 'meshdirect.queuedTurns.v1';
+  var MAX_QUEUED_TURNS = 12;
   var STATE_POLL_MS = 5000;
   var JOB_POLL_MS = 2500;
   var MAX_MESSAGE = 12000;
@@ -42,7 +44,8 @@
     sidebarCollapsed: false,
     notificationsEnabled: false,
     attachments: [],
-    sending: false
+    sending: false,
+    queuedTurns: readQueuedTurns()
   };
 
   /* ---------------- icons ---------------- */
@@ -482,6 +485,11 @@
           '<section class="chat-region" id="chat-region" aria-label="Conversation" tabindex="-1"><div class="messages" id="messages"></div></section>' +
           '<div class="status-strip" id="status-strip" role="status"><div class="status-strip-inner" id="status-strip-inner"></div></div>' +
           '<footer class="composer-shell">' +
+            '<div class="queue-mode-banner" id="queue-mode-banner" hidden>' +
+              '<span class="queue-mode-dot" aria-hidden="true"></span>' +
+              '<span><strong>Queue next</strong><small>The current turn keeps running. Send now to run this message immediately after it.</small></span>' +
+            '</div>' +
+            '<section class="queued-turns-panel" id="queued-turns-panel" aria-label="Queued messages" hidden></section>' +
             '<div class="attachment-preview" id="attachment-preview" aria-live="polite"></div>' +
             '<form class="composer" id="composer-form">' +
               '<input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />' +
@@ -519,6 +527,7 @@
     $('#attach-button').addEventListener('click', function () { $('#image-input').click(); });
     $('#image-input').addEventListener('change', selectImages);
     $('#abort-button').addEventListener('click', abortJob);
+    $('#queued-turns-panel').addEventListener('click', handleQueuedTurnAction);
     var input = $('#composer-input');
     input.addEventListener('input', function () { resizeComposer(input); });
     input.addEventListener('keydown', function (event) {
@@ -536,6 +545,8 @@
     updateNotificationButton();
     renderStrip();
     renderAttachments();
+    renderQueuedTurns();
+    updateSendControls();
   }
 
   function isMobile() { return window.matchMedia('(max-width: 820px)').matches; }
@@ -1032,6 +1043,170 @@
     renderMessages(false);
   }
 
+
+  /* ---------------- queued turns ---------------- */
+
+  function readQueuedTurns() {
+    try {
+      var parsed = JSON.parse(localStorage.getItem(QUEUED_TURNS_KEY) || '[]');
+      if (!Array.isArray(parsed)) return [];
+      return parsed.slice(-MAX_QUEUED_TURNS).flatMap(function (item) {
+        if (!item || typeof item !== 'object') return [];
+        if (item.model !== 'preview' && item.model !== 'stable') return [];
+        if (typeof item.message !== 'string' || !item.message.trim() || item.message.length > MAX_MESSAGE) return [];
+        return [{
+          id: typeof item.id === 'string' ? item.id : newClientTurnId(),
+          model: item.model,
+          message: item.message,
+          attachments: [],
+          createdAt: Number.isFinite(Number(item.createdAt)) ? Number(item.createdAt) : Date.now(),
+        }];
+      });
+    } catch (error) {
+      try { localStorage.removeItem(QUEUED_TURNS_KEY); } catch (e) { /* storage may be blocked */ }
+      return [];
+    }
+  }
+
+  function persistQueuedTurns() {
+    try {
+      // Image data can exceed localStorage by itself. Text turns survive reload;
+      // image turns remain queued in memory and the UI explicitly says to keep
+      // this page open until they have been submitted.
+      var durable = state.queuedTurns.filter(function (item) {
+        return !item.attachments || item.attachments.length === 0;
+      }).map(function (item) {
+        return {
+          id: item.id,
+          model: item.model,
+          message: item.message,
+          createdAt: item.createdAt,
+        };
+      });
+      if (durable.length) localStorage.setItem(QUEUED_TURNS_KEY, JSON.stringify(durable));
+      else localStorage.removeItem(QUEUED_TURNS_KEY);
+    } catch (error) { /* storage may be blocked */ }
+  }
+
+  function queuedTurnSummary(item) {
+    var text = String(item.message || '').replace(/\s+/g, ' ').trim();
+    var count = Array.isArray(item.attachments) ? item.attachments.length : 0;
+    if (!text) text = count === 1 ? 'Attached image' : count + ' attached images';
+    return text.length > 92 ? text.slice(0, 89) + '…' : text;
+  }
+
+  function renderQueuedTurns() {
+    var panel = $('#queued-turns-panel');
+    if (!panel) return;
+    panel.replaceChildren();
+    if (!state.queuedTurns.length) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    var heading = el('div', 'queued-turns-heading');
+    heading.appendChild(el('strong', '', state.queuedTurns.length === 1 ? '1 queued turn' : state.queuedTurns.length + ' queued turns'));
+    heading.appendChild(el('span', '', 'Runs in order'));
+    panel.appendChild(heading);
+    state.queuedTurns.forEach(function (item, index) {
+      var row = el('div', 'queued-turn-row');
+      row.appendChild(el('span', 'queued-turn-index', String(index + 1)));
+      var copy = el('span', 'queued-turn-copy');
+      copy.appendChild(el('strong', '', queuedTurnSummary(item)));
+      var imageCount = Array.isArray(item.attachments) ? item.attachments.length : 0;
+      var detail = modelInfo(item.model).label + ' · waiting';
+      if (imageCount) detail += ' · ' + imageCount + (imageCount === 1 ? ' image' : ' images') + ' · keep page open';
+      copy.appendChild(el('span', '', detail));
+      row.appendChild(copy);
+      var remove = el('button', 'queued-turn-cancel', 'Cancel');
+      remove.type = 'button';
+      remove.dataset.queuedTurnId = item.id;
+      remove.setAttribute('aria-label', 'Cancel queued turn ' + (index + 1));
+      row.appendChild(remove);
+      panel.appendChild(row);
+    });
+  }
+
+  function handleQueuedTurnAction(event) {
+    var button = event.target && event.target.closest ? event.target.closest('[data-queued-turn-id]') : null;
+    if (!button) return;
+    var id = button.dataset.queuedTurnId;
+    var before = state.queuedTurns.length;
+    state.queuedTurns = state.queuedTurns.filter(function (item) { return item.id !== id; });
+    if (state.queuedTurns.length === before) return;
+    persistQueuedTurns();
+    renderQueuedTurns();
+    setComposerStatus('Queued turn cancelled.');
+    announce('Queued turn cancelled.');
+  }
+
+  function queueCurrentDraft(input) {
+    var message = input.value.trim();
+    var attachments = state.attachments.slice();
+    if (!message && !attachments.length) return;
+    if (message.length > MAX_MESSAGE) {
+      setComposerStatus('Message is too long (max ' + MAX_MESSAGE + ' chars).', true);
+      return;
+    }
+    if (state.queuedTurns.length >= MAX_QUEUED_TURNS) {
+      setComposerStatus('The queue is full. Cancel or let a queued turn run first.', true);
+      return;
+    }
+    state.queuedTurns.push({
+      id: 'queued-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10),
+      model: state.selectedModel,
+      message: message,
+      attachments: attachments,
+      createdAt: Date.now(),
+    });
+    input.value = '';
+    state.attachments = [];
+    resizeComposer(input);
+    renderAttachments();
+    persistQueuedTurns();
+    renderQueuedTurns();
+    updateSendControls();
+    var note = attachments.length
+      ? 'Queued with ' + attachments.length + (attachments.length === 1 ? ' image. Keep this page open until it sends.' : ' images. Keep this page open until they send.')
+      : 'Message queued. It will send automatically after the current turn.';
+    setComposerStatus(note);
+    announce('Message queued.');
+  }
+
+  function drainQueuedTurn() {
+    var active = !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
+    if (active || state.sending || !state.queuedTurns.length) return;
+    if (state.job && (state.job.state === 'done' || state.job.state === 'error')) state.job = null;
+    var item = state.queuedTurns.shift();
+    persistQueuedTurns();
+    renderQueuedTurns();
+    state.selectedModel = item.model;
+    renderSidebar();
+    renderModelBar();
+    var input = $('#composer-input');
+    if (!input) {
+      state.queuedTurns.unshift(item);
+      persistQueuedTurns();
+      return;
+    }
+    input.value = item.message;
+    state.attachments = Array.isArray(item.attachments) ? item.attachments : [];
+    resizeComposer(input);
+    renderAttachments();
+    setComposerStatus('Sending the next queued turn…');
+    announce('Sending the next queued turn.');
+    setTimeout(function () {
+      var becameActive = !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
+      if (becameActive || state.sending) {
+        state.queuedTurns.unshift(item);
+        persistQueuedTurns();
+        renderQueuedTurns();
+        return;
+      }
+      sendMessage();
+    }, 40);
+  }
+
   /* ---------------- history ---------------- */
 
   function loadHistory(modelId, scroll) {
@@ -1088,21 +1263,31 @@
   }
 
   function updateSendControls() {
+    var form = $('#composer-form');
     var send = $('#send-button');
     var abort = $('#abort-button');
     var attach = $('#attach-button');
     var input = $('#composer-input');
+    var banner = $('#queue-mode-banner');
     var active = !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
+    if (form) form.classList.toggle('queue-active', active);
     if (send) {
-      send.hidden = active;
+      send.hidden = false;
       send.disabled = state.sending;
+      send.setAttribute('aria-label', active ? 'Queue next message' : 'Send message');
+      send.title = active ? 'Queue next message' : '';
     }
     if (abort) {
       abort.hidden = !active;
       abort.disabled = !!(state.job && state.job.stopInFlight);
     }
-    if (attach) attach.disabled = state.sending || active;
-    if (input) input.disabled = false; // composing during a turn is allowed; send is blocked below
+    if (attach) attach.disabled = state.sending;
+    if (input) {
+      input.disabled = false;
+      input.placeholder = active ? 'Queue another message…' : 'Message Qwen…';
+    }
+    if (banner) banner.hidden = !active;
+    renderQueuedTurns();
   }
 
   function newClientTurnId() {
@@ -1335,7 +1520,7 @@
     var input = $('#composer-input');
     if (!input || state.sending) return;
     if (state.job && state.job.state !== 'done' && state.job.state !== 'error') {
-      setComposerStatus('A turn is already in progress. Stop it first.', true);
+      queueCurrentDraft(input);
       return;
     }
     var message = input.value.trim();
@@ -1638,13 +1823,15 @@
     setComposerStatus('');
     renderMessages(true);
     updateSendControls();
-    // reconcile with server history, then clear the optimistic job view
-    loadHistory(job.model, false).then(function (refreshed) {
-      if (refreshed && state.job === job && job.state === 'done') {
+    // Reconcile with server history, then hand the composer to the next
+    // queued turn. The queue must continue even if a history refresh fails.
+    loadHistory(job.model, false).then(function () {
+      if (state.job === job && job.state === 'done') {
         state.job = null;
         renderMessages(false);
       }
       refreshState();
+      drainQueuedTurn();
     });
   }
 
@@ -1660,7 +1847,14 @@
     announce('Turn failed: ' + message);
     renderMessages(true);
     updateSendControls();
-    refreshState();
+    loadHistory(job.model, false).then(function () {
+      if (state.job === job && job.state === 'error') {
+        state.job = null;
+        renderMessages(false);
+      }
+      refreshState();
+      drainQueuedTurn();
+    });
   }
 
   function abortJob() {
@@ -1930,7 +2124,10 @@
       if (model.id !== state.selectedModel) loadHistory(model.id, false);
     });
     startStatePolling();
-    return recoverPendingTurn();
+    return recoverPendingTurn().then(function (recovered) {
+      if (!state.job) drainQueuedTurn();
+      return recovered;
+    });
   }
 
   function logout() {
@@ -1941,6 +2138,8 @@
         state.csrfToken = '';
         state.histories = {};
         state.job = null;
+        state.queuedTurns = [];
+        persistQueuedTurns();
         state.meshState = null;
         renderLogin('');
       })

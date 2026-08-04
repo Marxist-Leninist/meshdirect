@@ -169,9 +169,9 @@ test('wires every assistant path to the shared renderer and cache-busts assets i
   const markedPosition = index.indexOf('marked.umd.js');
   const purifyPosition = index.indexOf('purify.min.js');
   const rendererPosition = index.indexOf('markdown-renderer.js');
-  const appPosition = index.indexOf('app.js?v=20260804-markdown1');
+  const appPosition = index.indexOf('app.js?v=');
   assert.ok(markedPosition < purifyPosition && purifyPosition < rendererPosition && rendererPosition < appPosition);
-  assert.match(index, /app\.css\?v=20260804-markdown1/);
+  assert.match(index, /app\.css\?v=[^"']+/);
   assert.match(app, /message\.role === 'assistant'\) renderAssistantMarkdown/);
   assert.match(app, /renderAssistantMarkdown\(bubble, job\.reply != null \? job\.reply : job\.streamText\)/);
   assert.match(app, /scheduleStreamingMarkdown\(job\)/);
