@@ -342,7 +342,13 @@ class AgentLoop {
         } catch (error) {
           if (signal && signal.aborted) throw error;
           const message = sanitizeError(error && error.message);
-          result = safeJson({ ok: false, error: message }, this.config.maxToolResultChars);
+          // Classify the failure so the model can reason about retries:
+          // transport kinds carry actionable hints, tool kinds mean the
+          // remote tool itself rejected the call.
+          const errorKind = error && error.kind ? error.kind : (error && error.transport ? 'transport' : 'tool');
+          const errorPayload = { ok: false, error: message, errorKind };
+          if (error && error.elapsedMs !== undefined) errorPayload.elapsedMs = error.elapsedMs;
+          result = safeJson(errorPayload, this.config.maxToolResultChars);
           record.status = 'error';
           activity({ phase: 'tool', status: 'error', label, tool: label, error: message, round, toolCount });
         }
