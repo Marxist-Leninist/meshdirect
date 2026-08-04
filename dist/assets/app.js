@@ -1171,6 +1171,7 @@
         state: itemState,
         createdAt: Number(item.createdAt) || null,
         appliedAt: Number(item.appliedAt) || null,
+        interrupted: !!item.interrupted,
       }];
     }) : [];
     function count(name) { return items.filter(function (item) { return item.state === name; }).length; }
@@ -1224,6 +1225,7 @@
           state: 'pending',
           createdAt: Number(data.createdAt) || Date.now(),
           appliedAt: null,
+          interrupted: !!data.interrupted,
         });
       }
     } else if (data.state === 'applied' || data.state === 'not-applied') {
@@ -1248,7 +1250,9 @@
       job.reply = null;
     }
     if (data.state === 'accepted') {
-      job.activity = 'Steering accepted; waiting for the next model step';
+      job.activity = data.interrupted
+        ? 'Steering accepted; stopping the stale model draft'
+        : 'Steering accepted; waiting for the next model step';
     } else if (data.state === 'applied') {
       job.activity = data.resetOutput ? 'Revising the reply from your steering' : 'Applying your steering';
       setComposerStatus('Steering applied. Qwen is revising the current turn.');
@@ -1822,10 +1826,15 @@
       }
       var instruction = result && result.instruction;
       var applied = instruction && instruction.state === 'applied';
-      job.activity = applied ? 'Steering applied; revising the reply' : 'Steering accepted; waiting for the next model step';
+      var interrupted = instruction && instruction.interrupted;
+      job.activity = applied
+        ? 'Steering applied; revising the reply'
+        : (interrupted ? 'Steering accepted; stopping the stale model draft' : 'Steering accepted; waiting for the next model step');
       setComposerStatus(applied
         ? 'Steering was already applied. Qwen is revising the current turn.'
-        : 'Steering accepted. It will apply at the next safe model step.');
+        : (interrupted
+          ? 'Steering accepted. The stale model draft is stopping so Qwen can replan now.'
+          : 'Steering accepted. It will apply after the active tool finishes.'));
       announce('Steering instruction accepted.');
       if (state.job === job && job.state !== 'done' && job.state !== 'error') {
         persistPendingTurn(job, job.stopRequested ? 'stopping' : job.state);

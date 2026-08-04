@@ -73,7 +73,7 @@ class JobManager {
       createdAt: Date.now(), startedAt: null, finishedAt: null,
       reply: '', error: null, usage: null, status: null, outputRevision: 0,
       abort: null, listeners: new Set(), tools: [], activity: 'Waiting', steering: [],
-      acceptingSteering: false,
+      interruptCurrentDecision: null,
     };
     this.jobs.set(job.jobId, job);
     if (dedupeKey) this.turnIndex.set(dedupeKey, job.jobId);
@@ -117,6 +117,7 @@ class JobManager {
           state: item.state,
           createdAt: item.createdAt,
           appliedAt: item.appliedAt || null,
+          interrupted: !!item.interrupted,
         })),
       } : { pending: 0, applied: 0, notApplied: 0, items: [] },
     };
@@ -202,13 +203,22 @@ class JobManager {
       duplicate: false,
     };
     job.steering.push(entry);
-    job.activity = 'Steering accepted; waiting for the next safe boundary';
+    let interrupted = false;
+    if (typeof job.interruptCurrentDecision === 'function') {
+      try { interrupted = job.interruptCurrentDecision() !== false; }
+      catch { interrupted = false; }
+    }
+    entry.interrupted = interrupted;
+    job.activity = interrupted
+      ? 'Steering accepted; stopping the stale model draft'
+      : 'Steering accepted; waiting for the next safe boundary';
     this._emit(job, 'steer', {
       id: entry.id,
       clientSteerId: entry.clientSteerId,
       clientSteeringId: entry.clientSteerId,
       state: 'accepted',
       createdAt: entry.createdAt,
+      interrupted,
       pending: job.steering.filter((item) => item.state === 'pending').length,
       applied: job.steering.filter((item) => item.state === 'applied').length,
       resetOutput: false,
@@ -300,6 +310,7 @@ class JobManager {
       listeners: new Set(),
       abort: null,
       steering: [],
+      interruptCurrentDecision: null,
       durable: true,
     };
   }
@@ -417,6 +428,9 @@ class JobManager {
           if (steering.length) streamedAny = false;
           return steering;
         },
+        setSteeringInterrupt: (interrupt) => {
+          job.interruptCurrentDecision = typeof interrupt === 'function' ? interrupt : null;
+        },
         onDelta: (text) => {
           streamedAny = true;
           live.lastActivity = 'writing';
@@ -501,6 +515,7 @@ class JobManager {
       job.attachments = [];
       lane.running = null;
       job.abort = null;
+      job.interruptCurrentDecision = null;
       const next = lane.queue.shift();
       if (next) this._start(next);
       this._broadcastQueue(job.model);

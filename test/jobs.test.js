@@ -141,10 +141,13 @@ test('a running job applies idempotent steering and clears stale streamed output
   const entered = new Promise((resolve) => { enter = resolve; });
   let release;
   const wait = new Promise((resolve) => { release = resolve; });
+  let interruptions = 0;
   const agent = {
     async run(input) {
+      input.setSteeringInterrupt(() => { interruptions += 1; return true; });
       enter(input);
       await wait;
+      input.setSteeringInterrupt(null);
       const steering = input.takeSteering({ round: 2, resetOutput: true, phase: 'after-decision' });
       assert.deepEqual(steering.map((item) => item.message), ['Check the relay, not DNS.']);
       return { reply: 'steered', usage: null, tools: [] };
@@ -162,6 +165,8 @@ test('a running job applies idempotent steering and clears stale streamed output
   const entry = manager.steerJob(job, '  Check the relay, not DNS.  ', clientSteerId);
   const duplicate = manager.steerJob(job, 'Check the relay, not DNS.', clientSteerId);
   assert.equal(entry.state, 'pending');
+  assert.equal(entry.interrupted, true);
+  assert.equal(interruptions, 1);
   assert.equal(duplicate.id, entry.id);
   assert.equal(duplicate.duplicate, true);
   assert.equal(job.steering.length, 1);
@@ -174,7 +179,7 @@ test('a running job applies idempotent steering and clears stale streamed output
   assert.equal(job.state, 'done');
   assert.equal(job.reply, 'steered');
   assert.equal(job.steering[0].state, 'applied');
-  assert.ok(events.some((event) => event.state === 'accepted'));
+  assert.ok(events.some((event) => event.state === 'accepted' && event.interrupted === true));
   assert.ok(events.some((event) => event.state === 'applied' && event.resetOutput === true));
   assert.equal(manager.publicView(job).steering.applied, 1);
 

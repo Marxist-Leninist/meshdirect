@@ -13,7 +13,10 @@ const { sanitizeError } = require('./util');
 let primaryKey = null;
 let fallbackKey = null;
 
-function resolvePrimaryKey(config, force) {
+function resolvePrimaryKey(config, force, signal) {
+  if (signal && signal.aborted) {
+    return Promise.reject(new ProviderError('aborted', 499, false));
+  }
   if (primaryKey && !force) return Promise.resolve(primaryKey);
   const input = JSON.stringify({
     protocolVersion: 1,
@@ -21,14 +24,41 @@ function resolvePrimaryKey(config, force) {
     ids: [config.providers.primary.resolverId],
   });
   return new Promise((resolve, reject) => {
-    const child = execFile(config.providers.primary.resolverPath, [], { timeout: 15000, maxBuffer: 64 * 1024 }, (err, stdout) => {
+    let settled = false;
+    let child = null;
+    const cleanup = () => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+    };
+    const finish = (error, key) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(key);
+    };
+    const onAbort = () => {
+      try { if (child && !child.killed) child.kill('SIGTERM'); } catch { /* already gone */ }
+      finish(new ProviderError('aborted', 499, false));
+    };
+    child = execFile(config.providers.primary.resolverPath, [], { timeout: 15000, maxBuffer: 64 * 1024 }, (err, stdout) => {
+      if (settled) return;
       let out = null;
       try { out = JSON.parse(stdout || '{}'); } catch { /* fall through */ }
       const key = out && out.values && out.values[config.providers.primary.resolverId];
-      if (typeof key === 'string' && key.length > 8) { primaryKey = key; resolve(key); }
-      else reject(new Error(`key resolver failed: ${err ? err.message : 'empty values'}`));
+      if (typeof key === 'string' && key.length > 8) {
+        primaryKey = key;
+        finish(null, key);
+      } else {
+        finish(new Error(`key resolver failed: ${err ? err.message : 'empty values'}`));
+      }
     });
-    child.stdin.end(input);
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }
+    try {
+      if (!settled) child.stdin.end(input);
+    } catch (error) { finish(error); }
   });
 }
 
@@ -347,6 +377,7 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
         }
         armStall();
         r.on('data', (chunk) => {
+          if (settled) return;
           armStall();
           lineBuf += chunk.toString('utf8');
           let idx;
@@ -357,6 +388,7 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
           }
         });
         r.on('end', () => {
+          if (settled) return;
           if (lineBuf.trim()) handleLine(lineBuf.replace(/\r$/, ''));
           try {
             assertStreamCompleted(sawDone, finishReason, gotDelta);
@@ -383,12 +415,14 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
 async function runChat(config, modelId, messages, opts) {
   const attempts = [];
   let lastErr = null;
+  if (opts.signal && opts.signal.aborted) throw new ProviderError('aborted', 499, false);
   try {
-    const key = await resolvePrimaryKey(config, false);
+    const key = await resolvePrimaryKey(config, false, opts.signal);
     attempts.push({ provider: config.providers.primary, key });
     attempts.push({ provider: config.providers.primary, key: null, refresh: true }); // on 401 only
     attempts.push({ provider: config.providers.primary, key: null, retry: true }); // transient pre-output retry
   } catch (error) {
+    if (error && error.status === 499) throw error;
     lastErr = new ProviderError(error.message, 502, true);
     if (opts.onProviderError) opts.onProviderError(config.providers.primary.name, 502, sanitizeError(error.message));
   }
@@ -396,16 +430,26 @@ async function runChat(config, modelId, messages, opts) {
 
   let sawOutput = false;
   for (const attempt of attempts) {
+    if (opts.signal && opts.signal.aborted) throw new ProviderError('aborted', 499, false);
     if (attempt.refresh && !(lastErr && lastErr.status === 401)) continue; // refresh retry only after 401
     if (attempt.retry && !(lastErr && shouldRetryPrimary(lastErr.status))) continue;
     if (attempt.refresh) {
-      try { attempt.key = await resolvePrimaryKey(config, true); }
-      catch (e) { lastErr = new ProviderError(e.message, 502, true); continue; }
+      try { attempt.key = await resolvePrimaryKey(config, true, opts.signal); }
+      catch (e) {
+        if (e && e.status === 499) throw e;
+        lastErr = new ProviderError(e.message, 502, true);
+        continue;
+      }
     } else if (attempt.retry) {
-      try { attempt.key = await resolvePrimaryKey(config, false); }
-      catch (e) { lastErr = new ProviderError(e.message, 502, true); continue; }
+      try { attempt.key = await resolvePrimaryKey(config, false, opts.signal); }
+      catch (e) {
+        if (e && e.status === 499) throw e;
+        lastErr = new ProviderError(e.message, 502, true);
+        continue;
+      }
     }
     if (!attempt.key) continue;
+    if (opts.signal && opts.signal.aborted) throw new ProviderError('aborted', 499, false);
     try {
       const out = await chatAttempt(config, attempt.provider, attempt.key, providerModelId(attempt.provider, modelId), messages, {
         ...opts,

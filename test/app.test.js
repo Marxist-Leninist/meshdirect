@@ -105,10 +105,13 @@ test('authenticated clients can steer idempotently through the by-client route',
   const running = new Promise((resolve) => { entered = resolve; });
   let release;
   const wait = new Promise((resolve) => { release = resolve; });
+  let interruptions = 0;
   const agent = {
     async run(input) {
+      input.setSteeringInterrupt(() => { interruptions += 1; return true; });
       entered();
       await wait;
+      input.setSteeringInterrupt(null);
       const steering = input.takeSteering({ round: 2, resetOutput: true });
       return { reply: steering.map((item) => item.message).join(' | '), usage: null, tools: [] };
     },
@@ -159,6 +162,8 @@ test('authenticated clients can steer idempotently through the by-client route',
   assert.equal(accepted.accepted, true);
   assert.equal(accepted.instruction.state, 'pending');
   assert.equal(accepted.instruction.clientSteeringId, clientSteeringId);
+  assert.equal(accepted.instruction.interrupted, true);
+  assert.equal(interruptions, 1);
   assert.equal(accepted.steering.pending, 1);
 
   const retry = await fetch(`${base}/chat/${encodeURIComponent(job.jobId)}/steer`, {

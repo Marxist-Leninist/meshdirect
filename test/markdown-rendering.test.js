@@ -185,6 +185,7 @@ test('wires every assistant path to the shared renderer and cache-busts assets i
   assert.match(app, /clientSteeringId/);
   assert.match(app, /function applySteeringEvent\(job, data\)/);
   assert.match(app, /function requireSeparateTurnConfirmation\(job, message\)/);
+  assert.match(app, /The stale model draft is stopping so Qwen can replan now/);
   assert.doesNotMatch(app, /turn finished before steering was accepted, so this message was queued next/);
   assert.match(app, /Your text is untouched; press send again/);
   assert.doesNotMatch(app, /MAX_QUEUED_TURNS/);

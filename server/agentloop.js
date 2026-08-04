@@ -129,7 +129,7 @@ class AgentLoop {
     this.gateway = dependencies.gateway || new SGToolGateway(config, log);
   }
 
-  async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta, onDelta, takeSteering }) {
+  async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta, onDelta, takeSteering, setSteeringInterrupt }) {
     const transcript = messages.map((message) => ({ ...message }));
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     const tools = [];
@@ -138,6 +138,9 @@ class AgentLoop {
     let lastProvider = '';
 
     const activity = (value) => { if (onActivity) onActivity(value); };
+    const registerSteeringInterrupt = (value) => {
+      if (typeof setSteeringInterrupt === 'function') setSteeringInterrupt(value);
+    };
     const yieldToIo = () => new Promise((resolve) => setImmediate(resolve));
     const consumeSteering = (meta) => {
       if (typeof takeSteering !== 'function') return [];
@@ -180,12 +183,53 @@ class AgentLoop {
         });
       }
       activity({ phase: 'model', status: 'running', label: 'Qwen is deciding the next step', round });
-      const output = await this.modelclient.runChat(this.config, modelId, transcript, {
-        signal,
-        tools: MODEL_TOOLS,
-        onProviderError,
-        onDelta, // live filtered text chunks; tool markup never reaches this path
+      const decisionAbort = new AbortController();
+      const decisionSignal = signal
+        ? AbortSignal.any([signal, decisionAbort.signal])
+        : decisionAbort.signal;
+      let interruptedForSteering = false;
+      registerSteeringInterrupt(() => {
+        if (decisionAbort.signal.aborted) return false;
+        interruptedForSteering = true;
+        decisionAbort.abort(new Error('live steering'));
+        return true;
       });
+
+      let output;
+      try {
+        output = await this.modelclient.runChat(this.config, modelId, transcript, {
+          signal: decisionSignal,
+          tools: MODEL_TOOLS,
+          onProviderError,
+          onDelta, // live filtered text chunks; tool markup never reaches this path
+        });
+      } catch (error) {
+        // Give the accepted steering request one I/O turn to enter the pending
+        // queue after its provider abort. A whole-turn stop always wins.
+        await yieldToIo();
+        if (signal && signal.aborted) throw error;
+        const duringModelSteering = consumeSteering({
+          round, resetOutput: true, phase: 'during-model',
+        });
+        if (interruptedForSteering && duringModelSteering.length) {
+          answerParts.length = 0;
+          appendSteering(duringModelSteering);
+          activity({
+            phase: 'steer',
+            status: 'applied',
+            label: duringModelSteering.length === 1
+              ? 'Stopped the stale model draft and applied steering'
+              : `Stopped the stale model draft and applied ${duringModelSteering.length} steering instructions`,
+            round,
+            steeringCount: duringModelSteering.length,
+          });
+          continue;
+        }
+        throw error;
+      } finally {
+        registerSteeringInterrupt(null);
+      }
+
       lastProvider = output.provider || lastProvider;
       addUsage(usage, output.usage);
 

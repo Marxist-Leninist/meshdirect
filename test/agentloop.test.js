@@ -500,3 +500,73 @@ test('steering already waiting in the I/O queue wins the tool completion race', 
   assert.deepEqual(executions, ['sg1']);
   assert.equal(modelCalls, 2);
 });
+
+test('live steering aborts the in-flight model draft and replans immediately', async () => {
+  const pending = [];
+  const applied = [];
+  const activities = [];
+  let interrupt = null;
+  let modelCalls = 0;
+  let entered;
+  const providerStarted = new Promise((resolve) => { entered = resolve; });
+
+  const loop = new AgentLoop(config(), () => {}, {
+    modelclient: {
+      async runChat(_config, _model, messages, opts) {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          opts.onDelta('Stale draft that must disappear.');
+          entered();
+          return new Promise((resolve, reject) => {
+            const fail = () => {
+              const error = new Error('aborted');
+              error.status = 499;
+              reject(error);
+            };
+            if (opts.signal.aborted) fail();
+            else opts.signal.addEventListener('abort', fail, { once: true });
+          });
+        }
+        assert.equal(messages.some((message) => (
+          message.role === 'assistant' && String(message.content).includes('Stale draft')
+        )), false);
+        assert.match(messages.at(-1).content, /Use the relay immediately/);
+        return {
+          reply: 'Replanned immediately around the relay.',
+          toolCalls: [],
+          usage: {},
+          provider: 'test',
+        };
+      },
+    },
+    gateway: { execute: async () => { throw new Error('no tool expected'); } },
+  });
+
+  const running = loop.run({
+    modelId: 'qwen-test',
+    messages: [{ role: 'user', content: 'Repair access.' }],
+    setSteeringInterrupt(value) { interrupt = value; },
+    takeSteering(meta) {
+      const items = pending.splice(0);
+      if (items.length) applied.push(meta);
+      return items;
+    },
+    onActivity(event) { activities.push(event); },
+    onDelta() {},
+  });
+
+  await providerStarted;
+  pending.push({ id: 'instant', message: 'Use the relay immediately.' });
+  assert.equal(typeof interrupt, 'function');
+  assert.equal(interrupt(), true);
+
+  const result = await running;
+  assert.equal(result.reply, 'Replanned immediately around the relay.');
+  assert.equal(modelCalls, 2);
+  assert.equal(interrupt, null);
+  assert.equal(applied[0].phase, 'during-model');
+  assert.equal(applied[0].resetOutput, true);
+  assert.ok(activities.some((event) => (
+    event.phase === 'steer' && /Stopped the stale model draft/.test(event.label)
+  )));
+});

@@ -7,11 +7,15 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   ToolCallTextFilter,
   providerModelId,
   shouldRetryPrimary,
+  runChat,
 } = require('../server/modelclient');
 const { AgentLoop } = require('../server/agentloop');
 
@@ -93,4 +97,38 @@ test('AgentLoop forwards onDelta to the model client', async () => {
   });
   assert.deepEqual(seen, ['chunk-1', 'chunk-2']);
   assert.equal(result.reply, 'chunk-1chunk-2');
+});
+
+
+test('steering abort also interrupts an in-flight key resolver', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meshdirect-resolver-abort-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const resolver = path.join(directory, 'slow-resolver.js');
+  fs.writeFileSync(resolver, `#!/usr/bin/env node
+process.stdin.resume();
+setTimeout(() => {
+  process.stdout.write(JSON.stringify({ values: { qa_key: 'not-a-real-provider-key' } }));
+}, 10000);
+`);
+  fs.chmodSync(resolver, 0o700);
+
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const pending = runChat({
+    providers: {
+      primary: {
+        name: 'qa-primary',
+        resolverProvider: 'qa',
+        resolverId: 'qa_key',
+        resolverPath: resolver,
+      },
+      fallback: { enabled: false },
+    },
+  }, 'qa-model', [{ role: 'user', content: 'hello' }], {
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(new Error('live steering')), 30);
+
+  await assert.rejects(pending, (error) => error && error.status === 499);
+  assert.ok(Date.now() - startedAt < 1000, 'resolver abort should not wait for its ten-second timer');
 });

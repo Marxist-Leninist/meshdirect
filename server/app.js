@@ -245,6 +245,7 @@ function createApp(config, log, dependencies = {}) {
         createdAt: steering.createdAt,
         appliedAt: steering.appliedAt || null,
         duplicate: !!steering.duplicate,
+        interrupted: !!steering.interrupted,
       };
       return res.status(steering.duplicate ? 200 : 202).json({
         ...view,
