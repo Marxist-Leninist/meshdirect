@@ -316,9 +316,13 @@ class McpRegistry {
    tool access, running detached so the parent can keep working and collect the
    result later. Depth is capped so a runaway agent cannot fork-bomb the box. */
 class SubagentRunner {
-  constructor(config, log, dir) {
+  constructor(config, log, dir, caps) {
     this.config = config;
     this.log = log;
+    // Nested agents share the exact capability gateway used by their parent.
+    // That keeps memory, skills, schedules, the MCP registry and the running
+    // subagent registry coherent instead of creating stale per-agent copies.
+    this.caps = caps;
     this.dir = path.join(dir, 'subagents');
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.running = new Map();
@@ -363,7 +367,10 @@ class SubagentRunner {
       depth + 1 >= MAX_SUBAGENT_DEPTH ? 'You are at the maximum nesting depth and cannot spawn further subagents.' : '',
     ].filter(Boolean).join('\n');
 
-    const agent = new AgentLoop(this.config, this.log, {});
+    const agent = new AgentLoop(this.config, this.log, {
+      caps: this.caps,
+      depth: rec.depth,
+    });
     const messages = [
       { role: 'system', content: system },
       { role: 'user', content: brief },
@@ -704,7 +711,7 @@ class CapabilityGateway {
     this.memory = new MemoryStore(dir);
     this.skills = new SkillStore(dir);
     this.mcp = new McpRegistry(dir, config, log);
-    this.subagents = new SubagentRunner(config, log, dir);
+    this.subagents = new SubagentRunner(config, log, dir, this);
     this.scheduler = new SelfScheduler(config, log, dir);
   }
 

@@ -136,6 +136,9 @@ class AgentLoop {
     this.modelclient = dependencies.modelclient || modelclient;
     this.gateway = dependencies.gateway || new SGToolGateway(config, log);
     this.caps = dependencies.caps || new CapabilityGateway(config, log);
+    this.depth = Number.isSafeInteger(dependencies.depth)
+      ? Math.max(0, dependencies.depth)
+      : 0;
   }
 
   async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta, onDelta, takeSteering, setSteeringInterrupt }) {
@@ -356,7 +359,7 @@ class AgentLoop {
         let result;
         try {
           const value = this.caps.handles(call.name)
-            ? await this.caps.execute(call.name, call.arguments, { signal })
+            ? await this.caps.execute(call.name, call.arguments, { signal, depth: this.depth })
             : await this.gateway.execute(call.name, call.arguments, { signal });
           result = safeJson({ ok: true, ...value }, this.config.maxToolResultChars);
           record.status = 'complete';

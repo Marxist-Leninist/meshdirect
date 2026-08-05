@@ -117,6 +117,50 @@ test('agent loop executes SG tool call and only emits the final answer', async (
   assert.doesNotMatch(result.reply, /tool_call/);
 });
 
+test('capability tool execution receives the AgentLoop nesting depth', async () => {
+  let providerCall = 0;
+  let seenOptions = null;
+  const caps = {
+    promptContext() { return ''; },
+    handles(name) { return name === 'subagent'; },
+    async execute(name, args, options) {
+      assert.equal(name, 'subagent');
+      assert.equal(args.action, 'spawn');
+      seenOptions = options;
+      return { blocked: true };
+    },
+  };
+  const loop = new AgentLoop(config(), () => {}, {
+    depth: 2,
+    caps,
+    gateway: { async execute() { throw new Error('SG gateway should not be called'); } },
+    modelclient: {
+      async runChat(_config, _model, messages) {
+        providerCall += 1;
+        if (providerCall === 1) {
+          return {
+            reply: '',
+            toolCalls: [{
+              id: 'spawn-1', type: 'function',
+              function: { name: 'subagent', arguments: JSON.stringify({ action: 'spawn', task: 'nested' }) },
+            }],
+            usage: {}, provider: 'test', finishReason: 'tool_calls',
+          };
+        }
+        assert.equal(messages.at(-1).role, 'tool');
+        return { reply: 'Depth was enforced.', toolCalls: [], usage: {}, provider: 'test', finishReason: 'stop' };
+      },
+    },
+  });
+  const result = await loop.run({
+    modelId: 'test',
+    messages: [{ role: 'user', content: 'spawn' }],
+    onActivity() {},
+  });
+  assert.equal(result.reply, 'Depth was enforced.');
+  assert.equal(seenOptions.depth, 2);
+});
+
 test('malformed tool markup is withheld and retried', async () => {
   let calls = 0;
   const loop = new AgentLoop(config(), () => {}, {

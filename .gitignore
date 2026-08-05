@@ -8,3 +8,6 @@ scripts/.*
 server/*.bak-*
 backups/
 dist/assets/*.bak-*
+
+# Runtime capability state: memories, skills, schedules, MCP registry, subagents.
+state/

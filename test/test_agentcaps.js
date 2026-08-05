@@ -211,13 +211,31 @@ async function check(name, fn) {
   await check('spawn with no task is rejected', async () => {
     await assert.rejects(() => caps.execute('subagent', { action: 'spawn', task: '   ' }));
   });
-  await check('spawn records a running subagent and list shows it', async () => {
-    const out = await caps.execute('subagent', { action: 'spawn', task: 'summarise the disk layout', label: 'disk' });
-    assert.strictEqual(out.spawned, true);
-    const listed = await caps.execute('subagent', { action: 'list' });
-    assert.ok(listed.subagents.find((s) => s.id === out.id));
-    const st = await caps.execute('subagent', { action: 'status', id: out.id });
-    assert.ok(['running', 'error', 'done'].includes(st.state));
+  await check('spawn shares capabilities and enforces inherited nesting depth', async () => {
+    const agentloopModule = require('/opt/meshdirect/server/agentloop');
+    const OriginalAgentLoop = agentloopModule.AgentLoop;
+    let childDependencies = null;
+    agentloopModule.AgentLoop = class FakeNestedAgentLoop {
+      constructor(_config, _log, dependencies) { childDependencies = dependencies; }
+      async run() { return { reply: 'nested result', usage: {}, tools: [] }; }
+    };
+    try {
+      const out = await caps.execute(
+        'subagent',
+        { action: 'spawn', task: 'summarise the disk layout', label: 'disk' },
+        { depth: 1 },
+      );
+      assert.strictEqual(out.spawned, true);
+      assert.strictEqual(childDependencies.caps, caps, 'child must share the parent capability gateway');
+      assert.strictEqual(childDependencies.depth, 2, 'child AgentLoop must inherit the incremented depth');
+      const result = await caps.execute('subagent', { action: 'result', id: out.id, wait: 2 });
+      assert.strictEqual(result.state, 'done');
+      assert.strictEqual(result.result, 'nested result');
+      const listed = await caps.execute('subagent', { action: 'list' });
+      assert.ok(listed.subagents.find((s) => s.id === out.id));
+    } finally {
+      agentloopModule.AgentLoop = OriginalAgentLoop;
+    }
   });
   await check('result on an unknown id is rejected', async () => {
     await assert.rejects(() => caps.execute('subagent', { action: 'result', id: 'sub-doesnotexist' }));
