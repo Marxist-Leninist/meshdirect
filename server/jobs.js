@@ -13,15 +13,13 @@ class JobManager {
     this.agent = dependencies.agent || new AgentLoop(config, log, dependencies);
     this.jobs = new Map(); // jobId -> job
     this.turnIndex = new Map(); // ownerKey + clientTurnId -> jobId
-    this.lanes = {
-      preview: { running: null, queue: [] },
-      stable: { running: null, queue: [] },
-    };
+    this.lanes = {};
     // live per-model observability for /state
-    this.live = {
-      preview: this._freshLive(),
-      stable: this._freshLive(),
-    };
+    this.live = {};
+    for (const id of Object.keys(config.lanes || {})) {
+      this.lanes[id] = { running: null, queue: [] };
+      this.live[id] = this._freshLive();
+    }
     const t = setInterval(() => this._reap(), 60000);
     t.unref();
   }

@@ -112,10 +112,9 @@ function initAuth(config) {
       plan: config.planLabel,
       workspace: config.workspaceLabel,
       defaultModel: 'preview',
-      models: [
-        { id: 'preview', label: config.lanes.preview.label, detail: config.lanes.preview.detail },
-        { id: 'stable', label: config.lanes.stable.label, detail: config.lanes.stable.detail },
-      ],
+      models: Object.entries(config.lanes)
+        .filter(([, lane]) => lane && lane.enabled !== false)
+        .map(([id, lane]) => ({ id, label: lane.label, detail: lane.detail })),
     };
   }
 
