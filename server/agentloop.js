@@ -193,6 +193,13 @@ class AgentLoop {
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     const tools = [];
     const answerParts = [];
+    // Prose written immediately before a tool call. Normally discarded: the
+    // closing round carries the real answer and narration like 'let me check'
+    // should not survive. Kept only as a fallback for the case where the
+    // model puts its WHOLE answer before the call and then has nothing left
+    // to say, which otherwise ends the turn with an empty reply and wipes
+    // the text the user already watched stream in.
+    const preToolParts = [];
     let toolCount = 0;
     let lastProvider = '';
 
@@ -343,6 +350,7 @@ class AgentLoop {
       const decisionSteering = consumeSteering({ round, resetOutput: true, phase: 'after-decision' });
       if (decisionSteering.length) {
         answerParts.length = 0;
+        preToolParts.length = 0;
         appendSteering(decisionSteering);
         activity({
           phase: 'steer',
@@ -358,7 +366,15 @@ class AgentLoop {
 
       if (!calls.length) {
         const finalPart = String(textFallback.rawResidual || '');
-        const reply = `${answerParts.join('')}${finalPart}`.trim();
+        let reply = `${answerParts.join('')}${finalPart}`.trim();
+        if (!reply && preToolParts.length) {
+          // The tool did the work and the model had nothing to add. Return
+          // what it already said rather than an empty turn: re-prompting here
+          // just makes it restate itself, and onFinalDelta would blank the
+          // answer already on screen.
+          reply = preToolParts.join('\n\n').trim();
+          activity({ phase: 'model', status: 'recovered', label: 'Closing round was empty; kept the answer given before the tool call', round });
+        }
         if (!reply) {
           transcript.push({ role: 'assistant', content: '(empty response)' });
           transcript.push({ role: 'user', content: 'Return the completed answer as plain text.' });
@@ -373,6 +389,9 @@ class AgentLoop {
       if (maxToolCalls > 0 && toolCount + calls.length > maxToolCalls) {
         throw new Error(`Agent exceeded the ${maxToolCalls} tool-call limit`);
       }
+      const preToolText = String(textFallback.residual || '').trim();
+      if (preToolText) preToolParts.push(preToolText);
+
       const routed = calls.map(routeToolCall);
       transcript.push({
         role: 'assistant',
