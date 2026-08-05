@@ -22,6 +22,9 @@ clients over SSE.
   images maximum, 5 MB each, 12 MB total).
 - `server/app.js` — authenticated JSON API, CSRF/origin checks, SSE, and static
   frontend delivery.
+- `scripts/meshdirect-healthguard.sh` plus `deploy/meshdirect-healthguard.*`
+  — a systemd timer that verifies the private health route and repairs an
+  accidentally stopped or unhealthy service after two failed probes.
 
 Provider keys are never stored in this repository or environment files. The
 primary key is resolved into memory by `/usr/local/libexec/meshdirect-key-resolver`.
@@ -63,6 +66,9 @@ The production base is `/qwen38/api`; development also mounts `/api`.
 - Runtime MCP credentials should be referenced by environment variable or by a
   file under `/etc/meshdirect-secrets` or `/run/secrets`; secret values are not
   returned by the registry and sensitive literal headers are rejected.
+- The installed healthguard checks every 30 seconds. A healthy process is left
+  untouched; two consecutive failed probes cause the stopped service to be
+  started or an unhealthy active service to be restarted and verified.
 - Active queues are in memory; the browser recovers them across reloads and safely
   closes interrupted jobs after a service restart. Login sessions persist only as
   token digests in a private mode-0600 state file and slide forward while in use.
