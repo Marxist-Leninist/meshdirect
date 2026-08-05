@@ -117,7 +117,11 @@ function toolLabel(call) {
     const query = typeof args.query === 'string' ? args.query.trim() : '';
     return `${call.name.toUpperCase()} tool search${query ? `: ${query.slice(0, 80)}` : ''}`;
   }
-  const target = typeof args.name === 'string' ? args.name : 'invalid request';
+  const target = typeof args.name === 'string' && args.name.trim() ? args.name.trim()
+    : typeof args.key === 'string' && args.key.trim() ? args.key.trim()
+    : typeof args.query === 'string' && args.query.trim() ? args.query.trim()
+    : typeof args.action === 'string' && args.action.trim() ? args.action.trim()
+    : 'call';
   return `${call.name.toUpperCase()} · ${target.slice(0, 120)}`;
 }
 
