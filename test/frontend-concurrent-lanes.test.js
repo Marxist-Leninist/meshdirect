@@ -145,3 +145,121 @@ test('Preview and Stable keep independent submissions, streams, and composer dra
   modelButton('preview').click();
   assert.equal(input().value, 'preview follow-up draft', 'Preview draft should survive model switching');
 });
+
+test('back-forward cache restore reconnects both active lanes without cross-aborting them', async (t) => {
+  const dom = new JSDOM('<!doctype html><main id="app"></main>', {
+    runScripts: 'outside-only',
+    pretendToBeVisual: true,
+    url: 'https://zqx.lat/qwen38/',
+  });
+  t.after(() => dom.window.close());
+  const { window } = dom;
+  window.AbortController = globalThis.AbortController;
+  window.ReadableStream = globalThis.ReadableStream;
+  window.TextDecoder = globalThis.TextDecoder;
+  window.matchMedia = () => ({ matches: true, addListener() {}, removeListener() {} });
+
+  const ids = {
+    preview: 'web-preview-reconnect-1234',
+    stable: 'web-stable-reconnect-12345',
+  };
+  for (const model of ['preview', 'stable']) {
+    window.localStorage.setItem(`meshdirect.pendingTurn.v2.${model}`, JSON.stringify({
+      clientTurnId: ids[model],
+      username: 'owner',
+      jobId: `job-${model}`,
+      userMessageId: `user-${model}`,
+      model,
+      message: `${model} active work`,
+      displayMessage: `${model} active work`,
+      enqueuedAt: Date.now() - 5000,
+      status: 'running',
+      attachmentCount: 0,
+      attachmentKey: '',
+    }));
+  }
+
+  const streams = { preview: [], stable: [] };
+  let unexpectedPosts = 0;
+  window.fetch = async (url, options = {}) => {
+    const target = String(url);
+    const method = options.method || 'GET';
+    if (target.endsWith('/api/session')) {
+      return jsonResponse({
+        authenticated: true,
+        username: 'owner',
+        csrfToken: 'csrf-test',
+        model: 'Qwen 3.8 Mesh',
+        plan: 'test',
+        workspace: 'test',
+        defaultModel: 'preview',
+        models: [
+          { id: 'preview', label: 'Qwen 3.8 Preview', detail: 'Preview lane' },
+          { id: 'stable', label: 'Qwen 3.8', detail: 'Stable lane' },
+        ],
+      });
+    }
+    if (target.includes('/api/history?')) return jsonResponse({ messages: [] });
+    if (target.endsWith('/api/state')) {
+      return jsonResponse({
+        models: [],
+        lanes: {
+          preview: { running: { elapsedMs: 5000 }, queued: 0 },
+          stable: { running: { elapsedMs: 5000 }, queued: 0 },
+        },
+      });
+    }
+    if (target.endsWith('/api/chat') && method === 'POST') {
+      unexpectedPosts += 1;
+      return jsonResponse({ error: 'unexpected replay' }, 500);
+    }
+    const lookup = target.match(/\/api\/chat\/by-client\/(web-(preview|stable)-reconnect-[0-9]+)$/);
+    if (lookup) {
+      const model = lookup[2];
+      return jsonResponse({
+        jobId: `job-${model}`,
+        clientTurnId: ids[model],
+        userMessageId: `user-${model}`,
+        model,
+        state: 'running',
+        createdAt: Date.now() - 5000,
+        activity: 'Running',
+        steering: { pending: 0, applied: 0, notApplied: 0, items: [] },
+      });
+    }
+    const streamMatch = target.match(/\/api\/chat\/job-(preview|stable)\/stream$/);
+    if (streamMatch) {
+      const model = streamMatch[1];
+      streams[model].push(options.signal);
+      return {
+        ok: true,
+        status: 200,
+        headers: { get() { return 'text/event-stream'; } },
+        body: new window.ReadableStream({ start() {} }),
+      };
+    }
+    throw new Error(`Unexpected fetch: ${method} ${target}`);
+  };
+
+  window.eval(fs.readFileSync(path.join(root, 'dist/assets/app.js'), 'utf8'));
+  await waitFor(
+    () => streams.preview.length === 1 && streams.stable.length === 1,
+    'initial active streams were not recovered',
+  );
+  const oldPreview = streams.preview[0];
+  const oldStable = streams.stable[0];
+
+  const restored = new window.Event('pageshow');
+  Object.defineProperty(restored, 'persisted', { value: true });
+  window.dispatchEvent(restored);
+  await waitFor(
+    () => streams.preview.length === 2 && streams.stable.length === 2,
+    'bfcache restore did not reconnect both streams',
+  );
+
+  assert.equal(oldPreview.aborted, true, 'old Preview SSE should be replaced');
+  assert.equal(oldStable.aborted, true, 'old Stable SSE should be replaced');
+  assert.equal(streams.preview[1].aborted, false, 'new Preview SSE must remain live');
+  assert.equal(streams.stable[1].aborted, false, 'new Stable SSE must remain live');
+  assert.equal(unexpectedPosts, 0, 'recovery must never replay either accepted turn');
+});
