@@ -72,7 +72,7 @@ const config = {
   // token-plan.ap-southeast-1: "Range of input length should be [1, 983616]"
   // and "Range of max_tokens should be [1, 131072]").
   contextTokens: int(env.CONTEXT_TOKENS, 983616),
-  maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 32768),
+  maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 131072),
   systemPrompt: env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
   historyContextMessages: int(env.HISTORY_CONTEXT_MESSAGES, 50),
   historyContextMaxChars: int(env.HISTORY_CONTEXT_MAX_CHARS, 200000),
