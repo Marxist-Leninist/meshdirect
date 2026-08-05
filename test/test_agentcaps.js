@@ -442,6 +442,7 @@ async function check(name, fn) {
     assert.strictEqual(added.negotiatedTransport, 'streamable-http');
     assert.strictEqual(added.protocolVersion, '2025-11-25');
     assert.strictEqual(added.sessionful, true);
+    assert.strictEqual(added.serverInfo.name, 'stateful-test');
     const beforeExpiry = statefulInitializes;
     expireNextStatefulRequest = true;
     const called = await caps.execute('mcp_servers', {
@@ -460,6 +461,7 @@ async function check(name, fn) {
     const listed = await caps.execute('mcp_servers', { action: 'list' });
     const row = listed.servers.find((server) => server.name === 'stateful');
     assert.strictEqual(row.negotiatedTransport, 'streamable-http');
+    assert.strictEqual(row.serverInfo.name, 'stateful-test');
     assert.deepStrictEqual(row.headerEnv, { authorization: 'TEST_MCP_AUTH_HEADER' });
     assert.ok(!JSON.stringify(row).includes('test-secret'), 'registry output must not reveal auth values');
   });

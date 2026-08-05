@@ -554,6 +554,7 @@ class McpHttpClient {
     this.entry = entry;
     this.log = log;
     this.session = null;
+    this.serverInfo = null;
     this.toolHeaders = new Map();
     this.toolDefinitions = new Map();
   }
@@ -612,17 +613,26 @@ class McpHttpClient {
     if (sessionId && !VISIBLE_ASCII_RE.test(sessionId)) {
       throw new MCPResponseError('MCP server returned an invalid Mcp-Session-Id header');
     }
+    this.serverInfo = isPlainObject(response.result && response.result.serverInfo)
+      ? response.result.serverInfo
+      : null;
     this.session = { id: sessionId, protocolVersion: negotiated, initializedAt: Date.now() };
-    await requestHttpJsonRpc(this.entry.url, 'notifications/initialized', {}, this._options(
-      options.timeoutMs,
-      options.signal,
-      {
-        protocolVersion: negotiated,
-        sessionId,
-        standardHeaders: false,
-        notification: true,
-      },
-    ));
+    try {
+      await requestHttpJsonRpc(this.entry.url, 'notifications/initialized', {}, this._options(
+        options.timeoutMs,
+        options.signal,
+        {
+          protocolVersion: negotiated,
+          sessionId,
+          standardHeaders: false,
+          notification: true,
+        },
+      ));
+    } catch (error) {
+      this.session = null;
+      this.serverInfo = null;
+      throw error;
+    }
     return this.session;
   }
 
@@ -764,7 +774,7 @@ class McpHttpClient {
       transport: mode,
       protocolVersion: mode === 'session' && this.session ? this.session.protocolVersion : null,
       sessionful: mode === 'session' && Boolean(this.session && this.session.id),
-      serverInfo: null,
+      serverInfo: mode === 'session' ? this.serverInfo : null,
       tools,
     };
   }
@@ -827,6 +837,9 @@ class McpHttpClient {
       } catch (error) {
         if (retryHeaderMismatch && error instanceof MCPResponseError && error.code === -32020) {
           await this._listToolsMode('latest', options);
+          if (!this.toolDefinitions.has(name)) {
+            throw new MCPResponseError(`MCP server no longer advertises tool '${name}'`);
+          }
           return invoke(false);
         }
         throw error;
