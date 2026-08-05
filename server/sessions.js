@@ -219,16 +219,32 @@ function findTurnByClient(config, clientTurnId, ownerKey) {
 function statsFor(config, model, sessionId) {
   const msgs = readMessages(config, model, sessionId, 0);
   let totalTokens = 0, inputTokens = 0, outputTokens = 0, lastActivityAt = null;
+  let lastPromptTokens = 0, lastCompletionTokens = 0, lastTurnTokens = 0;
   for (const m of msgs) {
     if (m.usage) {
-      totalTokens += m.usage.total_tokens || 0;
-      inputTokens += m.usage.prompt_tokens || 0;
-      outputTokens += m.usage.completion_tokens || 0;
+      const prompt = Number(m.usage.prompt_tokens) || 0;
+      const completion = Number(m.usage.completion_tokens) || 0;
+      const total = Number(m.usage.total_tokens) || (prompt + completion);
+      totalTokens += total;
+      inputTokens += prompt;
+      outputTokens += completion;
+      lastPromptTokens = prompt;
+      lastCompletionTokens = completion;
+      lastTurnTokens = total;
     }
     const t = typeof m.timestamp === 'number' ? m.timestamp : Date.parse(m.timestamp);
     if (Number.isFinite(t) && (!lastActivityAt || t > lastActivityAt)) lastActivityAt = t;
   }
-  return { messageCount: msgs.length, totalTokens, inputTokens, outputTokens, lastActivityAt };
+  return {
+    messageCount: msgs.length,
+    totalTokens,
+    inputTokens,
+    outputTokens,
+    lastPromptTokens,
+    lastCompletionTokens,
+    lastTurnTokens,
+    lastActivityAt,
+  };
 }
 
 module.exports = {

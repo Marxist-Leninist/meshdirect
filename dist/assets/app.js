@@ -253,6 +253,41 @@
     return String(n);
   }
 
+  function toolPresentation(tool) {
+    var rawLabel = tool && typeof tool === 'object'
+      ? (tool.label || tool.name || 'Tool')
+      : String(tool || 'Tool');
+    var status = tool && typeof tool === 'object' && tool.status === 'running'
+      ? 'running'
+      : (tool && typeof tool === 'object' && tool.status === 'error' ? 'error' : 'complete');
+    var label = String(rawLabel);
+    var recovered = false;
+    var legacy = label.match(/^(MEMORY|SKILLS|MCP_SERVERS|SUBAGENT|SCHEDULE|GOALS)\s*·\s*invalid request$/i);
+    if (legacy && status === 'complete') {
+      label = legacy[1].toUpperCase() + ' · completed';
+      recovered = true;
+    } else if (legacy && status === 'error') {
+      label = legacy[1].toUpperCase() + ' · request rejected';
+    }
+    var glyph = status === 'running' ? '↻' : (status === 'error' ? '!' : '✓');
+    var title = status === 'running'
+      ? label + ' is running'
+      : (status === 'error' ? label + ' failed' : label + ' completed');
+    if (recovered) {
+      title = 'This completed call was mislabeled by an older harness version; no scheduler error occurred.';
+    }
+    return { label: label, status: status, recovered: recovered, glyph: glyph, title: title };
+  }
+
+  function toolChip(tool) {
+    var view = toolPresentation(tool);
+    var chip = el('span', 'tool-chip ' + view.status + (view.recovered ? ' recovered' : ''));
+    chip.textContent = view.glyph + ' ' + view.label;
+    chip.title = view.title;
+    chip.setAttribute('aria-label', view.title);
+    return chip;
+  }
+
   function fmtTimestamp(value) {
     var date = value == null ? null : new Date(value);
     if (!date || Number.isNaN(date.getTime())) return '';
@@ -1102,8 +1137,7 @@
     if (message.role === 'assistant' && Array.isArray(message.tools) && message.tools.length) {
       var tools = el('div', 'message-tools');
       message.tools.slice(0, 20).forEach(function (tool) {
-        var label = tool && typeof tool === 'object' ? (tool.label || tool.name || 'tool') : String(tool);
-        tools.appendChild(el('span', 'tool-chip', label));
+        tools.appendChild(toolChip(tool));
       });
       wrap.appendChild(tools);
     }
@@ -1160,11 +1194,12 @@
     heading.appendChild(el('span', '', running ? running + ' active now' : recent.length + ' used'));
     panel.appendChild(heading);
     recent.forEach(function (tool) {
-      var status = tool && tool.status === 'complete' ? 'complete' : (tool && tool.status === 'error' ? 'error' : 'running');
-      var row = el('div', 'tool-activity-row ' + status);
+      var view = toolPresentation(tool);
+      var row = el('div', 'tool-activity-row ' + view.status + (view.recovered ? ' recovered' : ''));
+      row.title = view.title;
       row.appendChild(el('span', 'tool-activity-dot'));
-      row.appendChild(el('span', 'tool-activity-name', tool && (tool.label || tool.name) ? String(tool.label || tool.name) : 'Tool'));
-      row.appendChild(el('span', 'tool-activity-status', status === 'complete' ? 'Done' : (status === 'error' ? 'Failed' : 'Using now')));
+      row.appendChild(el('span', 'tool-activity-name', view.label));
+      row.appendChild(el('span', 'tool-activity-status', view.status === 'complete' ? 'Done' : (view.status === 'error' ? 'Failed' : 'Using now')));
       panel.appendChild(row);
     });
     container.appendChild(panel);
@@ -2633,21 +2668,24 @@
     }
     strip.appendChild(elapsedItem);
 
-    // token / window gauge
+    // Last prompt context versus the model window. Session totals are cumulative
+    // billing/telemetry and must not be compared with a per-request context cap.
     if (info && info.stats) {
       var stats = info.stats;
-      var total = Number.isFinite(stats.totalTokens) ? stats.totalTokens : 0;
+      var used = Number.isFinite(stats.lastPromptTokens) ? Math.max(0, stats.lastPromptTokens) : 0;
+      var sessionTotal = Number.isFinite(stats.totalTokens) ? Math.max(0, stats.totalTokens) : 0;
       var window_ = Number.isFinite(stats.contextTokens) && stats.contextTokens > 0 ? stats.contextTokens : 262144;
-      var pct = Math.min(100, Math.round((total / window_) * 100));
+      var pct = Math.min(100, Math.round((used / window_) * 100));
       var gauge = el('span', 'strip-item token-gauge');
-      gauge.title = total.toLocaleString() + ' of ' + window_.toLocaleString() + ' context tokens (' + pct + '%)';
+      gauge.title = 'Last request context: ' + used.toLocaleString() + ' of ' + window_.toLocaleString() +
+        ' tokens (' + pct + '%). Cumulative session usage: ' + sessionTotal.toLocaleString() + ' tokens.';
       var track = el('span', 'token-gauge-track');
       var fill = el('span', 'token-gauge-fill' + (pct >= 80 ? ' hot' : ''));
       fill.style.width = pct + '%';
       track.appendChild(fill);
-      gauge.appendChild(el('span', '', 'Tokens'));
+      gauge.appendChild(el('span', '', 'Context'));
       gauge.appendChild(track);
-      gauge.appendChild(el('span', '', fmtTokens(total) + ' / ' + fmtTokens(window_)));
+      gauge.appendChild(el('span', '', fmtTokens(used) + ' / ' + fmtTokens(window_)));
       strip.appendChild(gauge);
     }
 

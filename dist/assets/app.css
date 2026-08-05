@@ -908,12 +908,24 @@ button {
 }
 
 .tool-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
   padding: 3px 8px;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.02);
   color: #9fb2a8;
   font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-chip.complete {
+  border-color: rgba(113, 132, 122, 0.36);
+  color: #aebfb6;
 }
 
 .tool-chip.running {
@@ -922,8 +934,15 @@ button {
 }
 
 .tool-chip.error {
-  border-color: rgba(255, 133, 141, 0.34);
+  border-color: rgba(255, 133, 141, 0.52);
+  background: rgba(255, 133, 141, 0.055);
   color: #f2b5ba;
+}
+
+.tool-chip.recovered {
+  border-style: dashed;
+  border-color: rgba(56, 227, 163, 0.34);
+  color: #b9d9c9;
 }
 
 .message-images {
@@ -1000,6 +1019,10 @@ button {
 
 .tool-activity-row.complete .tool-activity-dot {
   background: #71847a;
+}
+
+.tool-activity-row.recovered .tool-activity-dot {
+  background: #7cae95;
 }
 
 .tool-activity-row.error .tool-activity-dot {

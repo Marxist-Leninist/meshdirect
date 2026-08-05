@@ -110,9 +110,41 @@ function routeToolCall(call, index) {
   };
 }
 
+function labelPart(value, maximum = 80) {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/\s+/g, ' ').slice(0, maximum);
+}
+
+function capabilityTarget(call, args) {
+  const action = labelPart(args.action, 40);
+  if (!action) return 'invalid request';
+  let detail = '';
+  if (call.name === 'memory') {
+    detail = labelPart(args.key || args.id || (action === 'search' ? args.query : ''), 72);
+  } else if (call.name === 'skills') {
+    detail = labelPart(args.name, 72);
+  } else if (call.name === 'mcp_servers') {
+    const server = labelPart(args.name, 48);
+    const tool = labelPart(args.tool, 64);
+    detail = action === 'call'
+      ? [server, tool].filter(Boolean).join(' / ')
+      : (server || labelPart(args.query, 72));
+  } else if (call.name === 'subagent') {
+    detail = labelPart(args.label || args.id, 72);
+  } else if (call.name === 'schedule') {
+    detail = labelPart(args.id || args.note, 72);
+  } else if (call.name === 'goals') {
+    detail = labelPart(args.id, 72);
+  }
+  return `${action}${detail ? `: ${detail}` : ''}`.slice(0, 120);
+}
+
 function toolLabel(call) {
   const args = call.arguments || {};
   const action = args.action;
+  if (CAP_TOOL_NAMES.has(call.name)) {
+    return `${call.name.toUpperCase()} · ${capabilityTarget(call, args)}`;
+  }
   if (action === 'search') {
     const query = typeof args.query === 'string' ? args.query.trim() : '';
     return `${call.name.toUpperCase()} tool search${query ? `: ${query.slice(0, 80)}` : ''}`;
@@ -428,4 +460,5 @@ module.exports = {
   parseTextToolCalls,
   routeToolCall,
   safeJson,
+  toolLabel,
 };

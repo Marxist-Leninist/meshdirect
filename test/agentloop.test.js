@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { AgentLoop, parseTextToolCalls, routeToolCall } = require('../server/agentloop');
+const { AgentLoop, parseTextToolCalls, routeToolCall, toolLabel } = require('../server/agentloop');
 const {
   applyToolCallDelta,
   assertStreamCompleted,
@@ -12,6 +12,27 @@ const {
 function config() {
   return { maxAgentRounds: 6, maxToolCalls: 8, maxToolResultChars: 20_000 };
 }
+
+
+test('local capability chips describe the requested action instead of claiming invalid request', () => {
+  assert.equal(toolLabel({ name: 'schedule', arguments: { action: 'list' } }), 'SCHEDULE · list');
+  assert.equal(
+    toolLabel({ name: 'goals', arguments: { action: 'note', id: 'goal_msfg3pu43bze5d' } }),
+    'GOALS · note: goal_msfg3pu43bze5d'
+  );
+  assert.equal(
+    toolLabel({ name: 'skills', arguments: { action: 'read', name: 'mesh-cluster-ops' } }),
+    'SKILLS · read: mesh-cluster-ops'
+  );
+  assert.equal(
+    toolLabel({ name: 'mcp_servers', arguments: { action: 'call', name: 'lab', tool: 'probe' } }),
+    'MCP_SERVERS · call: lab / probe'
+  );
+  assert.equal(
+    toolLabel({ name: 'sg1', arguments: { action: 'call', name: 'remote_exec' } }),
+    'SG1 · remote_exec'
+  );
+});
 
 test('fragmented native function calls are reconstructed in index order', () => {
   const fragments = new Map();

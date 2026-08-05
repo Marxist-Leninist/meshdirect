@@ -72,3 +72,25 @@ test('restart reconciliation never replays an accepted pending turn', (t) => {
   assert.equal(stable.find((m) => m.id === completed.id).failed, undefined);
   assert.equal(stable.find((m) => m.id === completed.id).pending, undefined);
 });
+
+
+test('session stats distinguish cumulative usage from the latest prompt context', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meshdirect-token-stats-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const config = { sessionsDir: directory };
+  sessions.appendMessage(config, 'preview', 'main', {
+    role: 'assistant', content: 'first',
+    usage: { prompt_tokens: 900, completion_tokens: 100, total_tokens: 1000 },
+  });
+  sessions.appendMessage(config, 'preview', 'main', {
+    role: 'assistant', content: 'second',
+    usage: { prompt_tokens: 64000, completion_tokens: 800, total_tokens: 64800 },
+  });
+  const stats = sessions.statsFor(config, 'preview', 'main');
+  assert.equal(stats.totalTokens, 65800);
+  assert.equal(stats.inputTokens, 64900);
+  assert.equal(stats.outputTokens, 900);
+  assert.equal(stats.lastPromptTokens, 64000);
+  assert.equal(stats.lastCompletionTokens, 800);
+  assert.equal(stats.lastTurnTokens, 64800);
+});
