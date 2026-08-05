@@ -53,6 +53,13 @@ function createApp(config, log, dependencies = {}) {
 
   const auth = initAuth(config);
   const jobs = new JobManager(config, log, dependencies);
+  // Self-cron: the agent's scheduler needs a way to enqueue real turns.
+  // Wired here because the JobManager cannot exist before the agent does.
+  try {
+    if (jobs.agent && jobs.agent.caps && jobs.agent.caps.scheduler) jobs.agent.caps.scheduler.attach(jobs);
+  } catch (error) {
+    log(`agentcaps: scheduler not attached: ${error && error.message}`);
+  }
   const startedAt = Date.now();
 
   // --- API router (mounted at /qwen38/api and /api) ----------------------------

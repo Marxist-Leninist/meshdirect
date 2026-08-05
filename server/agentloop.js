@@ -2,6 +2,10 @@
 
 const modelclient = require('./modelclient');
 const { MODEL_TOOLS, SGToolGateway, normalizeArguments } = require('./sgtools');
+const { CAP_TOOLS, CAP_TOOL_NAMES, CapabilityGateway } = require('./agentcaps');
+
+// The model sees the SG gateways plus the local capability tools as one list.
+const ALL_TOOLS = [...MODEL_TOOLS, ...CAP_TOOLS];
 const { redactSecrets, sanitizeError } = require('./util');
 
 const TOOL_TAG_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
@@ -88,6 +92,10 @@ function routeToolCall(call, index) {
     // Only a valid JSON object can be promoted to a legacy shell call. A
     // malformed argument payload remains invalid and the gateway rejects it.
     if (args) args = { action: 'call', name: 'shell', arguments: args };
+  } else if (CAP_TOOL_NAMES.has(name)) {
+    // Local capability tools (memory, skills, subagent, schedule,
+    // mcp_servers) are executed in-process. Their arguments are their own;
+    // do not rewrite them into an SG discovery call.
   } else if (name !== 'sg1' && name !== 'sg2') {
     // A hallucinated direct function name must never become an accidental
     // no-argument call. Convert it into safe discovery; the next round can
@@ -127,10 +135,22 @@ class AgentLoop {
     this.log = log;
     this.modelclient = dependencies.modelclient || modelclient;
     this.gateway = dependencies.gateway || new SGToolGateway(config, log);
+    this.caps = dependencies.caps || new CapabilityGateway(config, log);
   }
 
   async run({ modelId, messages, signal, onActivity, onProviderError, onFinalDelta, onDelta, takeSteering, setSteeringInterrupt }) {
     const transcript = messages.map((message) => ({ ...message }));
+    // Fold the live skill index and memory digest into the system message so
+    // the agent starts each turn already knowing what it knows.
+    try {
+      const capContext = this.caps.promptContext();
+      if (capContext) {
+        const systemIndex = transcript.findIndex((m) => m && m.role === 'system');
+        if (systemIndex >= 0) transcript[systemIndex].content = `${transcript[systemIndex].content || ''}${capContext}`;
+      }
+    } catch (error) {
+      this.log(`agentcaps: prompt context unavailable: ${error && error.message}`);
+    }
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     const tools = [];
     const answerParts = [];
@@ -199,7 +219,7 @@ class AgentLoop {
       try {
         output = await this.modelclient.runChat(this.config, modelId, transcript, {
           signal: decisionSignal,
-          tools: MODEL_TOOLS,
+          tools: ALL_TOOLS,
           onProviderError,
           onDelta, // live filtered text chunks; tool markup never reaches this path
         });
@@ -335,7 +355,9 @@ class AgentLoop {
         activity({ phase: 'tool', status: 'running', label, tool: label, round, toolCount });
         let result;
         try {
-          const value = await this.gateway.execute(call.name, call.arguments, { signal });
+          const value = this.caps.handles(call.name)
+            ? await this.caps.execute(call.name, call.arguments, { signal })
+            : await this.gateway.execute(call.name, call.arguments, { signal });
           result = safeJson({ ok: true, ...value }, this.config.maxToolResultChars);
           record.status = 'complete';
           activity({ phase: 'tool', status: 'complete', label, tool: label, round, toolCount });
