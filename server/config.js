@@ -72,7 +72,18 @@ const config = {
   // token-plan.ap-southeast-1: "Range of input length should be [1, 983616]"
   // and "Range of max_tokens should be [1, 131072]").
   contextTokens: int(env.CONTEXT_TOKENS, 983616),
-  maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 131072),
+  // Per-model output ceilings, verified against the token-plan API:
+  //   qwen3.8-max         -> "Range of max_tokens should be [1, 131072]"
+  //   qwen3.8-max-preview -> "Range of max_tokens should be [1, 65536]"
+  // The preview model allows HALF the stable model. A single global value
+  // set to the stable ceiling makes every preview-lane request fail 400.
+  modelOutputLimits: {
+    'qwen3.8-max': int(env.MAX_OUTPUT_TOKENS_STABLE, 131072),
+    'qwen3.8-max-preview': int(env.MAX_OUTPUT_TOKENS_PREVIEW, 65536),
+  },
+  // Fallback for any model not listed above: the lower ceiling, so an
+  // unknown model degrades to a working request rather than a 400.
+  maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 65536),
   systemPrompt: env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
   historyContextMessages: int(env.HISTORY_CONTEXT_MESSAGES, 50),
   historyContextMaxChars: int(env.HISTORY_CONTEXT_MAX_CHARS, 200000),

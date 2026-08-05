@@ -233,8 +233,10 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
       model: modelId,
       messages,
       stream: true,
-      max_tokens: config.maxOutputTokens,
+      max_tokens: (config.modelOutputLimits && config.modelOutputLimits[modelId])
+        || config.maxOutputTokens,
       stream_options: { include_usage: true },
+      enable_thinking: config.enableThinking === true,
     };
     if (Array.isArray(opts.tools) && opts.tools.length) {
       requestBody.tools = opts.tools;
