@@ -21,6 +21,7 @@ const config = {
   // auth
   username: env.APP_USERNAME || '',
   passwordHash: env.APP_PASSWORD_HASH || '',
+  enableThinking: (env.ENABLE_THINKING || '').trim() === 'true',
   sessionTtlMs: int(env.SESSION_TTL_MS, 43200000),
   cookieSecure: bool(env.COOKIE_SECURE, true),
   cookiePath: env.COOKIE_PATH || (env.BASE_PATH || '/qwen38'),
@@ -67,7 +68,10 @@ const config = {
     sg1: { url: env.SG1_MCP_URL || 'http://10.0.1.20:8095/mcp' },
     sg2: { url: env.SG2_MCP_URL || 'http://10.0.1.30:8095/mcp' },
   },
-  contextTokens: 262144,
+  // Provider-stated hard limits for qwen3.8-max (verified 2026-08-05 against
+  // token-plan.ap-southeast-1: "Range of input length should be [1, 983616]"
+  // and "Range of max_tokens should be [1, 131072]").
+  contextTokens: int(env.CONTEXT_TOKENS, 983616),
   maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 32768),
   systemPrompt: env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
   historyContextMessages: int(env.HISTORY_CONTEXT_MESSAGES, 50),
