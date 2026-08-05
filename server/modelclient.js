@@ -233,8 +233,11 @@ function chatAttempt(config, provider, apiKey, modelId, messages, opts) {
       model: modelId,
       messages,
       stream: true,
-      max_tokens: (config.modelOutputLimits && config.modelOutputLimits[modelId])
-        || config.maxOutputTokens,
+      max_tokens: Math.min(
+        (config.modelOutputLimits && config.modelOutputLimits[modelId])
+          || config.maxOutputTokens,
+        65536,
+      ),
       stream_options: { include_usage: true },
       enable_thinking: config.enableThinking === true,
     };

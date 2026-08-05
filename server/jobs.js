@@ -365,7 +365,15 @@ class JobManager {
         clientTurnId: job.clientTurnId, ownerKey: job.ownerKey,
       });
       job.userMessageId = userRow.id;
-      const history = sessions.readMessages(cfg, job.model, 'main', cfg.historyContextMessages);
+      // kimi 2026-08-05 true-max: derive history budget from cfg.contextTokens
+      // (262144) instead of legacy fixed 50-msg/200k-char caps; env overrides preserved.
+      const _histMsgCap = Number(process.env.HISTORY_CONTEXT_MESSAGES || 1000);
+      const _cpt = Number(process.env.CHARS_PER_TOKEN || 4);
+      const _reserveTok = Number(process.env.HISTORY_RESERVE_TOKENS || 0)
+        || ((cfg.maxOutputTokens || 32768) + 16000); // kimi 2026-08-05: reserve must cover full output ceiling + system/tool overhead
+      const _histBudgetChars = Number(process.env.HISTORY_BUDGET_CHARS || 0)
+        || Math.max(200000, ((cfg.contextTokens || 262144) - _reserveTok) * _cpt);
+      const history = sessions.readMessages(cfg, job.model, 'main', _histMsgCap);
       const messages = [{ role: 'system', content: cfg.systemPrompt }];
       let chars = cfg.systemPrompt.length;
       const selected = [];
@@ -374,7 +382,7 @@ class JobManager {
       for (let index = history.length - 1; index >= 0; index -= 1) {
         const m = history[index];
         if (m.failed) continue; // never re-answer turns that errored/aborted
-        if (chars + m.content.length > cfg.historyContextMaxChars) break;
+        if (chars + m.content.length > _histBudgetChars) break;
         selected.push(m);
         chars += m.content.length;
       }

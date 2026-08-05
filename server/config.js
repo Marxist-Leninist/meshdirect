@@ -21,7 +21,8 @@ const config = {
   // auth
   username: env.APP_USERNAME || '',
   passwordHash: env.APP_PASSWORD_HASH || '',
-  enableThinking: (env.ENABLE_THINKING || '').trim() === 'true',
+  // Owner directive 2026-08-05: thinking is MAXIMUM by default; off only when explicitly disabled.
+  enableThinking: (env.ENABLE_THINKING || '').trim() !== 'false',
   sessionTtlMs: int(env.SESSION_TTL_MS, 43200000),
   cookieSecure: bool(env.COOKIE_SECURE, true),
   cookiePath: env.COOKIE_PATH || (env.BASE_PATH || '/qwen38'),
@@ -77,9 +78,11 @@ const config = {
   //   qwen3.8-max-preview -> "Range of max_tokens should be [1, 65536]"
   // The preview model allows HALF the stable model. A single global value
   // set to the stable ceiling makes every preview-lane request fail 400.
+  // Provider hard cap is 65536 for BOTH models (400: "Range of max_tokens
+  // should be [1, 65536]"). Never exceed it, whatever the env says.
   modelOutputLimits: {
-    'qwen3.8-max': int(env.MAX_OUTPUT_TOKENS_STABLE, 131072),
-    'qwen3.8-max-preview': int(env.MAX_OUTPUT_TOKENS_PREVIEW, 65536),
+    'qwen3.8-max': Math.min(int(env.MAX_OUTPUT_TOKENS_STABLE, 65536), 65536),
+    'qwen3.8-max-preview': Math.min(int(env.MAX_OUTPUT_TOKENS_PREVIEW, 65536), 65536),
   },
   // Fallback for any model not listed above: the lower ceiling, so an
   // unknown model degrades to a working request rather than a 400.
