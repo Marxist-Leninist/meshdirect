@@ -1084,7 +1084,13 @@
   }
 
   function currentJobActive() {
-    return !!state.job && state.job.state !== 'done' && state.job.state !== 'error';
+    // Scoped to the SELECTED lane. state.job is a single global slot, so without
+    // the model check a turn running on Qwen 3.8 forced the Preview composer into
+    // queue/steer mode as well — you could not talk to one lane while the other
+    // was busy, even though the server keeps a separate queue per lane.
+    if (!state.job) return false;
+    if (state.job.model && state.selectedModel && state.job.model !== state.selectedModel) return false;
+    return state.job.state !== 'done' && state.job.state !== 'error';
   }
 
   function canSteerCurrentJob() {

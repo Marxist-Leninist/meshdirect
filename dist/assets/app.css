@@ -1271,9 +1271,9 @@ button {
 
 .attachment-preview {
   width: min(100%, 900px);
-  margin: 0 auto 8px;
+  margin: 0 auto 4px;
   display: flex;
-  gap: 8px;
+  gap: 6px;
   overflow-x: auto;
   scrollbar-width: thin;
 }
@@ -1285,8 +1285,8 @@ button {
 .attachment-chip {
   flex: 0 0 auto;
   max-width: 220px;
-  height: 48px;
-  padding: 4px 6px 4px 4px;
+  height: 32px;
+  padding: 3px 4px 3px 3px;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -1298,8 +1298,8 @@ button {
 }
 
 .attachment-chip img {
-  width: 38px;
-  height: 38px;
+  width: 26px;
+  height: 26px;
   object-fit: cover;
   border-radius: 8px;
   background: #050906;
@@ -1314,8 +1314,8 @@ button {
 
 .attachment-chip button {
   flex: 0 0 auto;
-  width: 30px;
-  height: 30px;
+  width: 24px;
+  height: 24px;
   border: 0;
   border-radius: 8px;
   background: transparent;
@@ -1862,4 +1862,45 @@ button {
     padding: 0 6px;
     font-size: 9px;
   }
+}
+
+
+/* Compact attachment chips on narrow screens: the filename is the widest part
+   and the least useful once you can see the thumbnail. Keeps the composer from
+   eating the conversation area on mobile. */
+@media (max-width: 640px) {
+  .attachment-preview { margin-bottom: 3px; gap: 5px; }
+  .attachment-chip { height: 30px; max-width: 74px; }
+  .attachment-chip span { display: none; }
+  .attachment-chip img { width: 24px; height: 24px; }
+  .attachment-chip button { width: 22px; height: 22px; font-size: 16px; }
+}
+
+
+/* The composer row (attach | textarea | SEND) must never be pushed out of view
+   by the attachment strip when the on-screen keyboard shrinks the viewport.
+   Cap the strip's height and keep the send button from ever shrinking away. */
+.attachment-preview {
+  max-height: 36px;
+  flex: 0 0 auto;
+}
+
+.composer .send-button,
+.composer .attach-button {
+  flex: 0 0 auto;
+  min-width: 44px;   /* stays tappable and never collapses to zero */
+}
+
+@media (max-width: 640px) {
+  .attachment-preview { max-height: 32px; }
+  /* Shorter composer controls so the whole row survives a keyboard-shrunk
+     viewport; 44px is the minimum comfortable touch target. */
+  .composer .attach-button,
+  .composer .send-button {
+    width: 44px;
+    height: 44px;
+    border-radius: 13px;
+  }
+  .composer textarea { min-height: 44px; max-height: 120px; }
+  .composer-shell { padding-top: 8px; }
 }
