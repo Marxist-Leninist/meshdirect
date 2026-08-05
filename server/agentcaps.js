@@ -483,6 +483,7 @@ class SelfScheduler {
   /* app.js calls this once the JobManager exists (avoids a require cycle). */
   attach(jobs) {
     this.jobs = jobs;
+    this._ensureGoalTicker();
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(() => this._tick(), 15000);
     this.timer.unref();
@@ -491,6 +492,15 @@ class SelfScheduler {
   }
 
   _save() { writeJson(this.file, this.items); }
+
+  _ensureGoalTicker() {
+    if (this.file.includes(require('os').tmpdir())) return; // never pollute test schedulers
+    try {
+      const { GoalStore } = require('./goals');
+      const ensured = new GoalStore(require('path').dirname(this.file)).ensureGoalTicker(this);
+      if (ensured.ensured && !ensured.already) this.log(`agentcaps: goal-ticker registered (${ensured.id})`);
+    } catch (e) { this.log(`agentcaps: goal-ticker skipped: ${String(e && e.message || e)}`); }
+  }
 
   create({ prompt, delay_seconds, at, every_seconds, note = '', model = 'preview' }) {
     const body = str(prompt, 20000).trim();
@@ -595,6 +605,8 @@ class SelfScheduler {
 
 // -------------------------------------------------------------- tool specs
 
+const { GoalStore } = require('./goals');
+
 const CAP_TOOLS = [
   {
     type: 'function',
@@ -695,6 +707,25 @@ const CAP_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'goals',
+      description: "Your own goals, on disk, that YOU choose and follow. When you notice valuable recurring or multi-step work, action='add' it (priority 1-5, 5 = do first). On goal-ticker wakes or between tasks, action='next' returns the top open goal — work it for a bounded burst, then action='note' the progress. action='complete' when genuinely done, 'drop' if it stops mattering, 'list' to review. Goals persist across restarts; a goal-ticker wake fires every 30 minutes to keep you following them without the owner asking.",
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['add', 'list', 'next', 'note', 'complete', 'drop'] },
+          goal: { type: 'string', description: 'The goal text, for action=add.' },
+          why: { type: 'string', description: 'Why this goal is worth having, for action=add.' },
+          priority: { type: 'integer', minimum: 1, maximum: 5, description: '1-5, 5 = do first. Default 3.' },
+          id: { type: 'string', description: 'Goal id, for note/complete/drop.' },
+          text: { type: 'string', description: 'Progress note text, for action=note.' },
+        },
+        required: ['action'],
+      },
+    },
+  },
 ];
 
 const CAP_TOOL_NAMES = new Set(CAP_TOOLS.map((t) => t.function.name));
@@ -713,6 +744,7 @@ class CapabilityGateway {
     this.mcp = new McpRegistry(dir, config, log);
     this.subagents = new SubagentRunner(config, log, dir, this);
     this.scheduler = new SelfScheduler(config, log, dir);
+    this.goals = new GoalStore(dir);
   }
 
   handles(name) { return CAP_TOOL_NAMES.has(name); }
@@ -757,6 +789,14 @@ class CapabilityGateway {
         if (action === 'cancel') return this.scheduler.cancel(args);
         if (action === 'run_now') return this.scheduler.runNow(args);
         break;
+      case 'goals':
+        if (action === 'add') return this.goals.add(args);
+        if (action === 'list') return this.goals.list();
+        if (action === 'next') return this.goals.next();
+        if (action === 'note') return this.goals.note(args);
+        if (action === 'complete') return this.goals.complete(args);
+        if (action === 'drop') return this.goals.drop(args);
+        break;
       default:
         throw new MCPResponseError(`Unknown capability tool ${toolName}`);
     }
@@ -775,6 +815,9 @@ class CapabilityGateway {
       const extra = this.mcp.list();
       if (extra.total) parts.push(`MCP servers you have registered beyond sg1/sg2: ${extra.servers.map((s) => s.name).join(', ')}`);
     } catch { /* registry unreadable: prompt simply omits it */ }
+    const goalDigest = this.goals.digest(5);
+    if (goalDigest) parts.push(`Your open goals (work the top one on goal-ticker wakes):
+${goalDigest}`);
     return parts.length ? `\n\n${parts.join('\n\n')}` : '';
   }
 }

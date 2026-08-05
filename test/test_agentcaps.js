@@ -32,9 +32,9 @@ async function check(name, fn) {
 
 (async () => {
   console.log('== tool specs ==');
-  await check('5 capability tools exposed', () => {
+  await check('6 capability tools exposed', () => {
     const names = CAP_TOOLS.map((t) => t.function.name).sort();
-    assert.deepStrictEqual(names, ['mcp_servers', 'memory', 'schedule', 'skills', 'subagent']);
+    assert.deepStrictEqual(names, ['goals', 'mcp_servers', 'memory', 'schedule', 'skills', 'subagent']);
   });
   await check('every tool has a valid JSON schema', () => {
     for (const t of CAP_TOOLS) {
