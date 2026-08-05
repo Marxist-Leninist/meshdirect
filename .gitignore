@@ -11,3 +11,6 @@ dist/assets/*.bak-*
 
 # Runtime capability state: memories, skills, schedules, MCP registry, subagents.
 state/
+
+# Private uploaded image blobs and test fixtures.
+sessions/media/

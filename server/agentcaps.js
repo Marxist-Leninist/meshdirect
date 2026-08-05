@@ -16,16 +16,17 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { requestJsonRpc, MCPResponseError, MCPTransportError } = require('./sgtools');
+const { MCPResponseError } = require('./sgtools');
+const { McpHttpClient, authSummary, isValidToolName, normalizeAuthSpec, normalizeTransport } = require('./mcpclient');
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
-const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const MAX_SUBAGENT_DEPTH = 2;
 const MIN_WAKE_SECONDS = 30;
-const MAX_WAKE_SECONDS = 60 * 60 * 24 * 30;
+const MAX_DATE_MS = 8_640_000_000_000_000; // JavaScript Date's inclusive calendar limit.
 
 function nowMs() { return Date.now(); }
 function id(prefix) { return `${prefix}-${crypto.randomBytes(8).toString('hex')}`; }
+const PROCESS_INSTANCE_ID = id('meshproc');
 function clampInt(value, fallback, min, max) {
   const n = Number.parseInt(value, 10);
   if (!Number.isFinite(n)) return fallback;
@@ -33,6 +34,21 @@ function clampInt(value, fallback, min, max) {
 }
 function str(value, max = 20000) {
   return typeof value === 'string' ? value.slice(0, max) : '';
+}
+function wakeSeconds(value, fallback, label) {
+  const supplied = value !== undefined && value !== null && value !== '';
+  const seconds = supplied ? Number(value) : fallback;
+  if (!Number.isSafeInteger(seconds)) throw new MCPResponseError(`${label} must be a whole number of seconds`);
+  if (seconds < MIN_WAKE_SECONDS) throw new MCPResponseError(`${label} must be at least ${MIN_WAKE_SECONDS} seconds`);
+  const maximum = Math.floor((MAX_DATE_MS - nowMs()) / 1000);
+  if (seconds > maximum) throw new MCPResponseError(`${label} is beyond JavaScript's supported calendar range`);
+  return seconds;
+}
+function publicMcpTransport(mode) {
+  if (mode === 'latest') return 'current-http';
+  if (mode === 'session') return 'streamable-http';
+  if (mode === 'direct') return 'stateless';
+  return mode || 'auto';
 }
 
 /* Durable JSON that survives a crash mid-write: temp file, then rename. */
@@ -203,50 +219,135 @@ class McpRegistry {
     this.config = config;
     this.log = log;
     this.servers = readJson(this.file, {});
-    if (!this.servers || typeof this.servers !== 'object') this.servers = {};
+    if (!this.servers || typeof this.servers !== 'object' || Array.isArray(this.servers)) this.servers = {};
     this.catalog = new Map();
+    this.clients = new Map();
   }
 
   _save() { writeJson(this.file, this.servers); }
 
-  _url(name) {
+  _entry(name) {
     const entry = this.servers[name];
     if (!entry) throw new MCPResponseError(`No MCP server registered as '${name}'. Use action='list' to see them.`);
-    return entry.url;
+    return entry;
+  }
+
+  _client(name) {
+    const entry = this._entry(name);
+    const cached = this.clients.get(name);
+    if (cached && cached.entry === entry) return cached;
+    const client = new McpHttpClient(entry, this.log);
+    this.clients.set(name, client);
+    return client;
+  }
+
+  _markOk(name, tools) {
+    const entry = this._entry(name);
+    entry.lastOkAt = nowMs();
+    entry.toolCount = tools.length;
+    this._save();
   }
 
   list() {
     return {
       builtin: Object.keys(this.config.sgServers || {}),
       total: Object.keys(this.servers).length,
-      servers: Object.entries(this.servers).map(([name, v]) => ({
-        name, url: v.url, note: v.note || '', addedAt: v.addedAt, lastOkAt: v.lastOkAt || null, toolCount: v.toolCount ?? null,
+      servers: Object.entries(this.servers).map(([name, value]) => ({
+        name,
+        url: value.url,
+        note: value.note || '',
+        transport: publicMcpTransport(value.transport || 'auto'),
+        negotiatedTransport: publicMcpTransport(value.transport || 'auto'),
+        transportMode: value.transport || 'auto',
+        sessionful: Boolean(value.sessionful),
+        protocolVersion: value.protocolVersion || null,
+        serverInfo: value.serverInfo || null,
+        auth: authSummary(value.auth),
+        headerEnv: { ...((value.auth && value.auth.env) || {}) },
+        addedAt: value.addedAt,
+        lastOkAt: value.lastOkAt || null,
+        toolCount: value.toolCount ?? null,
       })),
     };
   }
 
-  async add({ name, url, note = '', timeout }) {
-    const key = str(name, 64).trim();
+  async _negotiate(name, timeoutMs, signal, preference) {
+    const entry = this._entry(name);
+    const requested = normalizeTransport(preference || entry.transportPreference || entry.transport || 'auto');
+    const candidate = { ...entry, transport: requested };
+    const client = new McpHttpClient(candidate, this.log);
+    const negotiated = await client.probe({ timeoutMs, signal });
+    entry.transport = negotiated.transport;
+    entry.protocolVersion = negotiated.protocolVersion || null;
+    entry.transportPreference = requested;
+    entry.sessionful = Boolean(negotiated.sessionful);
+    entry.serverInfo = negotiated.serverInfo || null;
+    entry.lastOkAt = nowMs();
+    entry.toolCount = negotiated.tools.length;
+    client.entry = entry;
+    this.clients.set(name, client);
+    this.catalog.set(name, { at: nowMs(), tools: negotiated.tools });
+    this._save();
+    return negotiated.tools;
+  }
+
+  async add(args) {
+    const key = str(args.name, 64).trim();
     if (!NAME_RE.test(key)) throw new MCPResponseError('MCP server name must be short and alphanumeric');
     if (this.config.sgServers && this.config.sgServers[key]) {
       throw new MCPResponseError(`'${key}' is a built-in server name; choose another`);
     }
-    const target = str(url, 2048).trim();
+    const target = str(args.url, 2048).trim();
     let parsed;
     try { parsed = new URL(target); } catch { throw new MCPResponseError('A valid http(s) MCP endpoint URL is required'); }
     if (!/^https?:$/.test(parsed.protocol)) throw new MCPResponseError('MCP endpoint must be http or https');
-
-    // Never register a server we cannot actually reach: prove tools/list works.
-    const timeoutMs = clampInt(timeout, 30, 1, 300) * 1000;
-    const result = await requestJsonRpc(target, 'tools/list', {}, { timeoutMs });
-    const tools = Array.isArray(result.tools) ? result.tools : [];
-    this.servers[key] = {
-      url: target, note: str(note, 500), addedAt: nowMs(), lastOkAt: nowMs(), toolCount: tools.length,
+    const transport = normalizeTransport(args.transport);
+    const protocolVersion = str(args.protocol_version, 40).trim();
+    if (protocolVersion && !/^\d{4}-\d{2}-\d{2}$/.test(protocolVersion)) {
+      throw new MCPResponseError('protocol_version must use the MCP YYYY-MM-DD format');
+    }
+    const timeoutMs = clampInt(args.timeout, 30, 1, 300) * 1000;
+    const candidate = {
+      url: target,
+      note: str(args.note, 500),
+      auth: normalizeAuthSpec(args),
+      transport,
+      transportPreference: transport,
+      protocolVersion: protocolVersion || null,
+      addedAt: nowMs(),
+      lastOkAt: null,
+      toolCount: null,
     };
+
+    // Probe before persistence. A typo or unusable credential therefore never
+    // becomes a durable server registration that fails forever on every turn.
+    const client = new McpHttpClient(candidate, this.log);
+    const negotiated = await client.probe({ timeoutMs });
+    candidate.transport = negotiated.transport;
+    candidate.protocolVersion = negotiated.protocolVersion || candidate.protocolVersion;
+    candidate.sessionful = Boolean(negotiated.sessionful);
+    candidate.serverInfo = negotiated.serverInfo || null;
+    candidate.lastOkAt = nowMs();
+    candidate.toolCount = negotiated.tools.length;
+    this.servers[key] = candidate;
+    client.entry = candidate;
+    this.clients.set(key, client);
+    this.catalog.set(key, { at: nowMs(), tools: negotiated.tools });
     this._save();
-    this.catalog.delete(key);
-    this.log(`agentcaps: registered MCP server ${key} (${tools.length} tools)`);
-    return { added: true, name: key, url: target, toolCount: tools.length };
+    this.log(`agentcaps: registered MCP server ${key} (${negotiated.tools.length} tools, ${candidate.transport})`);
+    return {
+      added: true,
+      name: key,
+      url: target,
+      transport: publicMcpTransport(candidate.transport),
+      negotiatedTransport: publicMcpTransport(candidate.transport),
+      transportMode: candidate.transport,
+      sessionful: Boolean(candidate.sessionful),
+      protocolVersion: candidate.protocolVersion,
+      serverInfo: candidate.serverInfo || null,
+      auth: authSummary(candidate.auth),
+      toolCount: negotiated.tools.length,
+    };
   }
 
   remove({ name }) {
@@ -255,58 +356,114 @@ class McpRegistry {
     delete this.servers[key];
     this._save();
     this.catalog.delete(key);
+    this.clients.delete(key);
     return { removed: true, name: key };
   }
 
-  async _tools(name, { refresh = false, timeoutMs } = {}) {
+  async _tools(name, { refresh = false, timeoutMs, signal } = {}) {
+    const entry = this._entry(name);
     const cached = this.catalog.get(name);
     if (!refresh && cached && nowMs() - cached.at < (this.config.sgCatalogTtlMs || 60000)) return cached.tools;
-    const result = await requestJsonRpc(this._url(name), 'tools/list', {}, { timeoutMs: timeoutMs || this.config.sgCallTimeoutMs });
-    const tools = Array.isArray(result.tools) ? result.tools.filter((t) => t && typeof t.name === 'string') : [];
+    const mode = normalizeTransport(entry.transport);
+    if (mode === 'auto') {
+      return this._negotiate(name, timeoutMs || this.config.sgCallTimeoutMs, signal, entry.transportPreference || 'auto');
+    }
+    if (entry.transport !== mode) {
+      entry.transport = mode;
+      this.clients.delete(name);
+      this._save();
+    }
+    const tools = (await this._client(name).listTools({
+      timeoutMs: timeoutMs || this.config.sgCallTimeoutMs,
+      signal,
+    })).filter((tool) => tool && typeof tool.name === 'string');
     this.catalog.set(name, { at: nowMs(), tools });
-    if (this.servers[name]) { this.servers[name].lastOkAt = nowMs(); this.servers[name].toolCount = tools.length; this._save(); }
+    this._markOk(name, tools);
     return tools;
   }
 
-  async test({ name, timeout }) {
+  async test({ name, timeout }, options = {}) {
+    const key = str(name, 64).trim();
+    this._entry(key);
     const startedAt = nowMs();
-    const tools = await this._tools(str(name, 64), { refresh: true, timeoutMs: clampInt(timeout, 30, 1, 300) * 1000 });
-    return { name, ok: true, toolCount: tools.length, elapsedMs: nowMs() - startedAt };
+    const tools = await this._negotiate(
+      key,
+      clampInt(timeout, 30, 1, 300) * 1000,
+      options.signal,
+      this.servers[key].transportPreference || 'auto',
+    );
+    return {
+      name: key,
+      ok: true,
+      transport: publicMcpTransport(this.servers[key].transport),
+      negotiatedTransport: publicMcpTransport(this.servers[key].transport),
+      transportMode: this.servers[key].transport,
+      sessionful: Boolean(this.servers[key].sessionful),
+      protocolVersion: this.servers[key].protocolVersion || null,
+      serverInfo: this.servers[key].serverInfo || null,
+      toolCount: tools.length,
+      elapsedMs: nowMs() - startedAt,
+    };
   }
 
-  async search({ name, query = '', limit = 40, timeout }) {
-    const key = str(name, 64);
-    const tools = await this._tools(key, { timeoutMs: clampInt(timeout, 60, 1, 300) * 1000 });
-    const q = str(query, 200).trim().toLowerCase();
-    const matched = q
-      ? tools.filter((t) => t.name.toLowerCase().includes(q) || String(t.description || '').toLowerCase().includes(q))
+  async search({ name, query = '', limit = 40, timeout }, options = {}) {
+    const key = str(name, 64).trim();
+    const tools = await this._tools(key, {
+      timeoutMs: clampInt(timeout, 60, 1, 300) * 1000,
+      signal: options.signal,
+    });
+    const queryText = str(query, 200).trim().toLowerCase();
+    const matched = queryText
+      ? tools.filter((tool) => tool.name.toLowerCase().includes(queryText)
+        || String(tool.description || '').toLowerCase().includes(queryText))
       : tools;
     return {
       server: key,
       matched: matched.length,
-      tools: matched.slice(0, clampInt(limit, 40, 1, 200)).map((t) => ({
-        name: t.name,
-        description: String(t.description || '').slice(0, 500),
-        inputSchema: t.inputSchema || { type: 'object' },
+      tools: matched.slice(0, clampInt(limit, 40, 1, 200)).map((tool) => ({
+        name: tool.name,
+        description: String(tool.description || '').slice(0, 500),
+        inputSchema: tool.inputSchema || { type: 'object' },
       })),
     };
   }
 
   async call({ name, tool, arguments: args, timeout }, options = {}) {
-    const key = str(name, 64);
-    const toolName = str(tool, 128).trim();
-    if (!TOOL_NAME_RE.test(toolName)) throw new MCPResponseError('A valid MCP tool name is required');
+    const key = str(name, 64).trim();
+    const toolName = str(tool, 1024);
+    if (!isValidToolName(toolName)) throw new MCPResponseError('A valid MCP tool name is required');
+    const toolArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
     const timeoutMs = clampInt(timeout, Math.ceil((this.config.sgCallTimeoutMs || 150000) / 1000), 1, 450) * 1000;
+    const entry = this._entry(key);
+    const mode = normalizeTransport(entry.transport);
+    if (mode === 'auto') {
+      await this._negotiate(key, timeoutMs, options.signal, entry.transportPreference || 'auto');
+    } else if (entry.transport !== mode) {
+      entry.transport = mode;
+      this.clients.delete(key);
+      this._save();
+    }
     const startedAt = nowMs();
-    const result = await requestJsonRpc(this._url(key), 'tools/call', {
-      name: toolName,
-      arguments: (args && typeof args === 'object' && !Array.isArray(args)) ? args : {},
-    }, { timeoutMs, signal: options.signal });
-    const text = Array.isArray(result && result.content)
-      ? result.content.map((c) => (c && typeof c.text === 'string' ? c.text : '')).filter(Boolean).join('\n')
-      : JSON.stringify(result);
-    if (result && result.isError) throw new MCPResponseError(String(text).slice(0, this.config.maxToolResultChars));
-    return { server: key, tool: toolName, result: String(text).slice(0, this.config.maxToolResultChars), elapsedMs: nowMs() - startedAt };
+    const result = await this._client(key).callTool(toolName, toolArgs, {
+      timeoutMs,
+      signal: options.signal,
+    });
+    const body = result && result.structuredContent !== undefined
+      ? JSON.stringify(result.structuredContent)
+      : (Array.isArray(result && result.content)
+        ? result.content.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
+        : JSON.stringify(result));
+    if (result && result.isError) throw new MCPResponseError(String(body).slice(0, this.config.maxToolResultChars));
+    entry.lastOkAt = nowMs();
+    this._save();
+    return {
+      server: key,
+      tool: toolName,
+      transport: publicMcpTransport(entry.transport),
+      transportMode: entry.transport,
+      result: String(body).slice(0, this.config.maxToolResultChars),
+      elapsedMs: nowMs() - startedAt,
+    };
   }
 }
 
@@ -326,6 +483,25 @@ class SubagentRunner {
     this.dir = path.join(dir, 'subagents');
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.running = new Map();
+    this.instanceId = PROCESS_INSTANCE_ID;
+    this._reconcileInterrupted();
+  }
+
+  _reconcileInterrupted() {
+    let files = [];
+    try { files = fs.readdirSync(this.dir).filter((file) => file.endsWith('.json')); } catch { files = []; }
+    let interrupted = 0;
+    for (const file of files) {
+      const rec = readJson(path.join(this.dir, file), null);
+      if (!rec || rec.state !== 'running' || rec.runnerInstanceId === this.instanceId) continue;
+      rec.state = 'interrupted';
+      rec.finishedAt = nowMs();
+      rec.error = 'MeshDirect restarted before this detached subagent completed. Spawn a replacement if the result is still needed.';
+      rec.interruptedByInstanceId = this.instanceId;
+      this._write(rec);
+      interrupted += 1;
+    }
+    if (interrupted) this.log(`agentcaps: reconciled ${interrupted} interrupted subagent${interrupted === 1 ? '' : 's'} after restart`);
   }
 
   _file(sid) { return path.join(this.dir, `${sid}.json`); }
@@ -349,6 +525,7 @@ class SubagentRunner {
       id: id('sub'), label: str(label, 120) || brief.slice(0, 80),
       task: brief, model: lane, modelId, depth: depth + 1,
       state: 'running', createdAt: nowMs(), finishedAt: null,
+      runnerInstanceId: this.instanceId, runnerPid: process.pid,
       result: '', error: null, usage: null, toolCalls: 0,
     };
     this._write(rec);
@@ -509,7 +686,7 @@ class SelfScheduler {
     let nextRunAt = null;
     let everyMs = null;
     if (every_seconds !== undefined && every_seconds !== null && every_seconds !== '') {
-      everyMs = clampInt(every_seconds, 3600, MIN_WAKE_SECONDS, MAX_WAKE_SECONDS) * 1000;
+      everyMs = wakeSeconds(every_seconds, 3600, 'every_seconds') * 1000;
       nextRunAt = nowMs() + everyMs;
     } else if (at) {
       const when = Date.parse(String(at));
@@ -517,8 +694,11 @@ class SelfScheduler {
       if (when <= nowMs()) throw new MCPResponseError("'at' must be in the future");
       nextRunAt = when;
     } else {
-      const delay = clampInt(delay_seconds, 300, MIN_WAKE_SECONDS, MAX_WAKE_SECONDS);
+      const delay = wakeSeconds(delay_seconds, 300, 'delay_seconds');
       nextRunAt = nowMs() + delay * 1000;
+    }
+    if (!Number.isFinite(nextRunAt) || nextRunAt > MAX_DATE_MS) {
+      throw new MCPResponseError("Schedule time is beyond JavaScript's supported calendar range");
     }
 
     const lane = this.config.lanes[model] ? model : 'preview';
@@ -594,8 +774,15 @@ class SelfScheduler {
     if (!due.length) return;
     for (const item of due) {
       this._fire(item);
-      if (item.everyMs) item.nextRunAt = nowMs() + item.everyMs;
-      else { item.enabled = false; item.nextRunAt = null; }
+      if (item.everyMs) {
+        const next = nowMs() + item.everyMs;
+        if (Number.isFinite(next) && next <= MAX_DATE_MS) item.nextRunAt = next;
+        else {
+          item.enabled = false;
+          item.nextRunAt = null;
+          item.lastError = "Repeating schedule reached JavaScript's supported calendar limit";
+        }
+      } else { item.enabled = false; item.nextRunAt = null; }
     }
     // Drop spent one-shots so the file does not grow without bound.
     this.items = this.items.filter((s) => s.enabled || (s.lastRunAt && nowMs() - s.lastRunAt < 86400000));
@@ -648,7 +835,7 @@ const CAP_TOOLS = [
     type: 'function',
     function: {
       name: 'mcp_servers',
-      description: "Add and use MCP tool servers beyond the built-in sg1/sg2. action='add' registers a new server by URL (it is probed first and rejected if unreachable), then 'search' and 'call' work against it exactly like sg1/sg2. Registrations persist across restarts.",
+      description: "Add and use MCP tool servers beyond the built-in sg1/sg2. action='add' probes before persistence: auto mode first tries current request-scoped MCP HTTP, then legacy initialize/session transport, then direct stateless JSON-RPC compatibility. Authentication can reference environment variables or protected secret files, so credential values are never written into the registry. Then use search/call like sg1/sg2.",
       parameters: {
         type: 'object',
         properties: {
@@ -656,6 +843,13 @@ const CAP_TOOLS = [
           name: { type: 'string', description: 'Registry name of the server.' },
           url: { type: 'string', description: 'JSON-RPC MCP endpoint URL, for action=add.' },
           note: { type: 'string' },
+          transport: { type: 'string', enum: ['auto', 'current-http', 'streamable-http', 'stateless'], description: 'For add: auto tries current stateless HTTP, then the initialized/session lifecycle, then legacy direct JSON-RPC. The other values force one mode.' },
+          protocol_version: { type: 'string', description: 'Optional MCP protocol date (YYYY-MM-DD) when a server requires a specific version.' },
+          headers: { type: 'object', additionalProperties: { type: 'string' }, description: 'Non-secret custom request headers. Sensitive headers such as Authorization must use header_env, header_files, or bearer_token_*.' },
+          header_env: { type: 'object', additionalProperties: { type: 'string' }, description: 'Map HTTP header names to environment-variable names. Only variable names are persisted; values are resolved for each request.' },
+          header_files: { type: 'object', additionalProperties: { type: 'string' }, description: 'Map HTTP header names to secret files under /etc/meshdirect-secrets or /run/secrets. File contents are never returned or persisted.' },
+          bearer_token_env: { type: 'string', description: 'Environment variable containing a bearer token. The token itself is never persisted.' },
+          bearer_token_file: { type: 'string', description: 'Bearer-token file under /etc/meshdirect-secrets or /run/secrets.' },
           tool: { type: 'string', description: 'Exact tool name for action=call.' },
           arguments: { type: 'object', additionalProperties: true },
           query: { type: 'string' },
@@ -690,7 +884,7 @@ const CAP_TOOLS = [
     type: 'function',
     function: {
       name: 'schedule',
-      description: 'Wake yourself up later. Creates a real turn at the chosen time with the prompt you supply, so you can come back to unfinished work, poll something that takes hours, or run a recurring check — without anyone asking. Use delay_seconds, an ISO timestamp in at, or every_seconds to repeat. Schedules survive restarts.',
+      description: 'Wake yourself up later. Creates a real turn at the chosen time with the prompt you supply, so you can come back to unfinished work, poll something that takes hours, or run a recurring check — without anyone asking. Use delay_seconds, any supported future ISO timestamp in at, or every_seconds to repeat. Long-range schedules are stored durably and polled, so they are not limited by setTimeout. Schedules survive restarts.',
       parameters: {
         type: 'object',
         properties: {
@@ -772,8 +966,8 @@ class CapabilityGateway {
         if (action === 'list') return this.mcp.list();
         if (action === 'add') return this.mcp.add(args);
         if (action === 'remove') return this.mcp.remove(args);
-        if (action === 'test') return this.mcp.test(args);
-        if (action === 'search') return this.mcp.search(args);
+        if (action === 'test') return this.mcp.test(args, options);
+        if (action === 'search') return this.mcp.search(args, options);
         if (action === 'call') return this.mcp.call(args, options);
         break;
       case 'subagent':
