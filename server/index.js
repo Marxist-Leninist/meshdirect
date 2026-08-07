@@ -4,6 +4,10 @@ const fs = require('fs');
 const config = require('./config');
 const modelclient = require('./modelclient');
 const sessions = require('./sessions');
+
+// Keep substantial text already streamed to the browser when a later model
+// round tries to replace it with a much shorter closing summary.
+require('./preserve-streamed-replies').install();
 const { createApp } = require('./app');
 
 const log = (msg) => console.log(`[meshdirect ${new Date().toISOString()}] ${msg}`);
